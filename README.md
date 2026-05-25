@@ -1,3 +1,3 @@
 # todo_app
 
-A new Flutter project.
+Personal productivty app. Minimalist UI showing todos by date.
