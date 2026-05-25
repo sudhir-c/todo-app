@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter --version)",
+      "Bash(flutter run *)",
+      "Bash(tee /tmp/flutter_run.log)",
+      "Bash(flutter analyze *)",
+      "Bash(python3 /tmp/build_list_lines_icon.py)",
+      "Bash(sips -g pixelWidth -g pixelHeight /Users/sudhirc/Downloads/todo_app/assets/icon/icon.png)",
+      "Bash(dart run *)",
+      "Bash(grep -E \"^\\\\.git$\")"
+    ]
+  }
+}
