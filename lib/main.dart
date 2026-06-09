@@ -14,6 +14,19 @@ const Color kNavy = Color.fromRGBO(0, 42, 92, 1);
 const Color kGreen = Color.fromRGBO(122, 193, 66, 1);
 const Color kSurfaceMuted = Color(0xFFF4F6F9);
 const Color kBorderSubtle = Color(0xFFE3E7EE);
+const Color kUntaggedGrey = Color(0xFF8A94A6);
+
+// Palette used to auto-assign a color to each new objective tag.
+const List<Color> kTagPalette = [
+  Color(0xFF2F6CF0), // blue
+  Color(0xFF7AC142), // app green
+  Color(0xFFE8643C), // orange
+  Color(0xFF9B51E0), // purple
+  Color(0xFF1FB6A8), // teal
+  Color(0xFFE0457B), // pink
+  Color(0xFFF2A900), // amber
+  Color(0xFF00A1E0), // sky
+];
 
 enum TodoStatus {
   notStarted,
@@ -79,12 +92,14 @@ class TodoItem {
   final TodoStatus status;
   final String description;
   final int dateId;
+  final int? tagId;
 
   const TodoItem({
     required this.id,
     required this.status,
     required this.description,
     required this.dateId,
+    this.tagId,
   });
 
   Map<String, Object?> toMap() {
@@ -93,13 +108,59 @@ class TodoItem {
       'is_completed': status.toCode(),
       'description': description,
       'day_id': dateId,
+      'tag_id': tagId,
     };
   }
 
   @override
   String toString() {
-    return 'TodoItem{id: $id, status: $status, description: $description, dateId: $dateId}';
+    return 'TodoItem{id: $id, status: $status, description: $description, dateId: $dateId, tagId: $tagId}';
   }
+}
+
+class Tag {
+  final int id;
+  final String name;
+  final int colorValue;
+  final int position;
+
+  const Tag({
+    required this.id,
+    required this.name,
+    required this.colorValue,
+    required this.position,
+  });
+
+  Color get color => Color(colorValue);
+
+  Map<String, Object?> toMap() {
+    return {
+      'id': id,
+      'name': name,
+      'color': colorValue,
+      'position': position,
+    };
+  }
+
+  @override
+  String toString() => 'Tag{id: $id, name: $name, position: $position}';
+}
+
+// Aggregated counts for one tag (or the Untagged bucket) within a scope.
+class TagStat {
+  final int? tagId;
+  final String label;
+  final Color color;
+  int total;
+  int completed;
+
+  TagStat({
+    required this.tagId,
+    required this.label,
+    required this.color,
+    this.total = 0,
+    this.completed = 0,
+  });
 }
 
 class Day {
@@ -134,10 +195,23 @@ void main() async {
         'CREATE TABLE days(id INTEGER PRIMARY KEY, date TEXT)',
       );
       await db.execute(
-        'CREATE TABLE todos(id INTEGER PRIMARY KEY, day_id INTEGER, is_completed INTEGER, description TEXT)',
+        'CREATE TABLE todos(id INTEGER PRIMARY KEY, day_id INTEGER, is_completed INTEGER, description TEXT, tag_id INTEGER)',
+      );
+      await db.execute(
+        'CREATE TABLE tags(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, color INTEGER, position INTEGER)',
       );
     },
-    version: 1,
+    onUpgrade: (db, oldVersion, newVersion) async {
+      // v1 -> v2: introduce objective tags. Additive only — existing todos
+      // keep all their data and simply gain a NULL (untagged) tag_id.
+      if (oldVersion < 2) {
+        await db.execute('ALTER TABLE todos ADD COLUMN tag_id INTEGER');
+        await db.execute(
+          'CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, color INTEGER, position INTEGER)',
+        );
+      }
+    },
+    version: 2,
   );
 
   runApp(const DailyTodoApp());
@@ -188,13 +262,15 @@ Future<List<TodoItem>> todoItems() async {
       'id': id as int,
       'day_id': dayId as int,
       'is_completed': isCompleted as int,
-      'description': description as String
+      'description': description as String,
+      'tag_id': tagId as int?
     } in todoMaps)
       TodoItem(
         id: id,
         dateId: dayId,
         status: TodoStatus.fromCode(isCompleted),
         description: description,
+        tagId: tagId,
       ),
   ];
 }
@@ -211,13 +287,15 @@ Future<List<TodoItem>> todoItemsForDay(int dayId) async {
       'id': id as int,
       'day_id': dayId as int,
       'is_completed': isCompleted as int,
-      'description': description as String
+      'description': description as String,
+      'tag_id': tagId as int?
     } in todoMaps)
       TodoItem(
         id: id,
         dateId: dayId,
         status: TodoStatus.fromCode(isCompleted),
         description: description,
+        tagId: tagId,
       ),
   ];
 }
@@ -235,13 +313,15 @@ Future<List<TodoItem>> todoItemsForDayRange(int startDayId, int endDayId) async 
       'id': id as int,
       'day_id': dayId as int,
       'is_completed': isCompleted as int,
-      'description': description as String
+      'description': description as String,
+      'tag_id': tagId as int?
     } in todoMaps)
       TodoItem(
         id: id,
         dateId: dayId,
         status: TodoStatus.fromCode(isCompleted),
         description: description,
+        tagId: tagId,
       ),
   ];
 }
@@ -250,6 +330,64 @@ Future<void> deleteTodoItem(int todoId) async {
   final db = await database;
   await db.delete(
     'todos',
+    where: 'id = ?',
+    whereArgs: [todoId],
+  );
+}
+
+Future<List<Tag>> tagsAll() async {
+  final db = await database;
+  final List<Map<String, Object?>> tagMaps = await db.query(
+    'tags',
+    orderBy: 'position ASC, id ASC',
+  );
+  return [
+    for (final {
+      'id': id as int,
+      'name': name as String,
+      'color': color as int,
+      'position': position as int
+    } in tagMaps)
+      Tag(id: id, name: name, colorValue: color, position: position),
+  ];
+}
+
+Future<int> insertTag(String name, int colorValue, int position) async {
+  final db = await database;
+  return await db.insert(
+    'tags',
+    {'name': name, 'color': colorValue, 'position': position},
+  );
+}
+
+Future<void> updateTagRow(Tag tag) async {
+  final db = await database;
+  await db.update(
+    'tags',
+    tag.toMap(),
+    where: 'id = ?',
+    whereArgs: [tag.id],
+  );
+}
+
+Future<void> deleteTagRow(int tagId) async {
+  final db = await database;
+  // Unlink any todos using this tag (they become untagged), then drop the tag.
+  await db.update(
+    'todos',
+    {'tag_id': null},
+    where: 'tag_id = ?',
+    whereArgs: [tagId],
+  );
+  await db.delete('tags', where: 'id = ?', whereArgs: [tagId]);
+}
+
+// Persists only the tag_id of a single todo without touching other fields.
+Future<void> updateTodoTag(int todoId, int? tagId) async {
+  final db = await database;
+  await db.update(
+    'todos',
+    {'tag_id': tagId},
     where: 'id = ?',
     whereArgs: [todoId],
   );
@@ -298,13 +436,32 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   final TextEditingController todoController = TextEditingController();
   final Map<int, int> _todoCountersByDay = {};
 
+  // Objective tags (persisted) and how breakdowns are displayed.
+  List<Tag> _tags = [];
+  bool _breakdownAsPercent = false;
+
   @override
   void initState() {
     super.initState();
     // Ensure current date is set to today's date (normalized to midnight)
     final now = DateTime.now();
     currentDate = DateTime(now.year, now.month, now.day);
+    loadTags();
     loadTodosForCurrentDate();
+  }
+
+  Future<void> loadTags() async {
+    final loaded = await tagsAll();
+    if (!mounted) return;
+    setState(() => _tags = loaded);
+  }
+
+  Tag? tagById(int? id) {
+    if (id == null) return null;
+    for (final t in _tags) {
+      if (t.id == id) return t;
+    }
+    return null;
   }
 
   Future<void> loadTodosForCurrentDate() async {
@@ -318,7 +475,11 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     setState(() {
       final key = getDateKey(currentDate);
       todosByDate[key] = dbTodos.map((todoItem) =>
-        Todo(text: todoItem.description, status: todoItem.status)
+        Todo(
+          text: todoItem.description,
+          status: todoItem.status,
+          tagId: todoItem.tagId,
+        )
       ).toList();
       
       todoIdsByDate[key] = dbTodos.map((todoItem) => todoItem.id).toList();
@@ -385,10 +546,26 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
         dateId: dayId,
         status: todo.status,
         description: todo.text,
+        tagId: todo.tagId,
       );
 
       await updateTodoItem(todoItem);
       print('Updated todo $todoId status: ${todo.status}');
+    }
+  }
+
+  void setTodoTag(int index, int? tagId) async {
+    setState(() {
+      final key = getDateKey(currentDate);
+      todosByDate[key]![index].tagId = tagId;
+    });
+
+    final key = getDateKey(currentDate);
+    if (todoIdsByDate.containsKey(key) &&
+        index < todoIdsByDate[key]!.length &&
+        todoIdsByDate[key]![index] != -1) {
+      final todoId = todoIdsByDate[key]![index];
+      await updateTodoTag(todoId, tagId);
     }
   }
 
@@ -455,6 +632,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
         dateId: dayId,
         status: todo.status,
         description: todo.text,
+        tagId: todo.tagId,
       );
       await insertTodoItem(todoItem);
     }
@@ -486,6 +664,97 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
       currentDate = DateTime.now();
     });
     await loadTodosForCurrentDate();
+  }
+
+  Future<void> addTag(String name) async {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return;
+    final color = kTagPalette[_tags.length % kTagPalette.length].value;
+    await insertTag(trimmed, color, _tags.length);
+    await loadTags();
+  }
+
+  Future<void> renameTag(Tag tag, String name) async {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return;
+    await updateTagRow(Tag(
+      id: tag.id,
+      name: trimmed,
+      colorValue: tag.colorValue,
+      position: tag.position,
+    ));
+    await loadTags();
+  }
+
+  Future<void> removeTag(Tag tag) async {
+    await deleteTagRow(tag.id);
+    // Unlink the deleted tag from any in-memory todos already loaded.
+    for (final list in todosByDate.values) {
+      for (final td in list) {
+        if (td.tagId == tag.id) td.tagId = null;
+      }
+    }
+    await loadTags();
+    if (mounted) setState(() {});
+  }
+
+  // Aggregates (tagId, status) pairs into per-tag totals (null => Untagged).
+  List<TagStat> computeTagStats(
+      Iterable<({int? tagId, TodoStatus status})> items) {
+    final byTag = <int?, TagStat>{};
+    for (final item in items) {
+      final stat = byTag.putIfAbsent(item.tagId, () {
+        final tag = tagById(item.tagId);
+        return TagStat(
+          tagId: item.tagId,
+          label: tag?.name ?? 'Untagged',
+          color: tag?.color ?? kUntaggedGrey,
+        );
+      });
+      stat.total++;
+      if (item.status == TodoStatus.completed) stat.completed++;
+    }
+    final stats = byTag.values.toList();
+    // Real tags first (alphabetical), Untagged last.
+    stats.sort((a, b) {
+      if (a.tagId == null) return 1;
+      if (b.tagId == null) return -1;
+      return a.label.toLowerCase().compareTo(b.label.toLowerCase());
+    });
+    return stats;
+  }
+
+  Future<void> openObjectives() async {
+    // Persist the current day first so the 30-day breakdown is accurate.
+    await pushDayAndTodos();
+    if (!mounted) return;
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => _ObjectivesSheet(
+        getTags: () => _tags,
+        percentMode: _breakdownAsPercent,
+        onPercentModeChanged: (v) => setState(() => _breakdownAsPercent = v),
+        onAddTag: addTag,
+        onRenameTag: renameTag,
+        onRemoveTag: removeTag,
+        fetchRangeStats: (days) async {
+          final endDayId = getDayId(DateTime.now());
+          final startDayId = endDayId - (days - 1);
+          final items = await todoItemsForDayRange(startDayId, endDayId);
+          return computeTagStats(
+            items.map((i) => (tagId: i.tagId, status: i.status)),
+          );
+        },
+      ),
+    );
+    // Reflect any tag edits made inside the sheet.
+    if (mounted) setState(() {});
   }
 
   Future<void> openSummarizeDialog() async {
@@ -800,6 +1069,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
           children: [
             _buildHeader(isToday, todos.length, completedCount, progress),
             _buildAddTodoBar(),
+            _buildDayBreakdown(todos),
             Expanded(
               child: todos.isEmpty
                   ? _buildEmptyState()
@@ -861,6 +1131,11 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
                     ),
                   ],
                 ),
+              ),
+              const SizedBox(width: 8),
+              _RoundIconButton(
+                icon: Icons.track_changes,
+                onTap: openObjectives,
               ),
               const SizedBox(width: 8),
               _RoundIconButton(
@@ -965,6 +1240,66 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     );
   }
 
+  Widget _buildDayBreakdown(List<Todo> todos) {
+    if (todos.isEmpty) return const SizedBox.shrink();
+
+    final stats = computeTagStats(
+      todos.map((t) => (tagId: t.tagId, status: t.status)),
+    );
+    final totalCompleted =
+        stats.fold<int>(0, (sum, s) => sum + s.completed);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 6, 20, 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                'TODAY\'S OBJECTIVES',
+                style: TextStyle(
+                  fontFamily: 'Jost',
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.2,
+                  color: Colors.grey.shade500,
+                ),
+              ),
+              const Spacer(),
+              _CountPercentToggle(
+                asPercent: _breakdownAsPercent,
+                onChanged: (v) => setState(() => _breakdownAsPercent = v),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 30,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: stats.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemBuilder: (context, i) {
+                final s = stats[i];
+                final value = _breakdownAsPercent
+                    ? (totalCompleted == 0
+                        ? '0%'
+                        : '${(s.completed / totalCompleted * 100).round()}%')
+                    : '${s.completed}/${s.total}';
+                return _TagStatChip(
+                  color: s.color,
+                  label: s.label,
+                  value: value,
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildEmptyState() {
     return Center(
       child: Column(
@@ -1037,7 +1372,10 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
           key: ValueKey('todo-$index-${todo.text}'),
           index: index,
           todo: todo,
+          tags: _tags,
+          selectedTag: tagById(todo.tagId),
           onStatusChange: (status) => setTodoStatus(index, status),
+          onTagChange: (tagId) => setTodoTag(index, tagId),
           onDelete: () => deleteTodo(index),
         );
       },
@@ -1054,10 +1392,12 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 class Todo {
   String text;
   TodoStatus status;
+  int? tagId;
 
   Todo({
     required this.text,
     this.status = TodoStatus.notStarted,
+    this.tagId,
   });
 }
 
@@ -1214,14 +1554,20 @@ class _LoadingDialog extends StatelessWidget {
 class _TodoCard extends StatelessWidget {
   final int index;
   final Todo todo;
+  final List<Tag> tags;
+  final Tag? selectedTag;
   final ValueChanged<TodoStatus> onStatusChange;
+  final ValueChanged<int?> onTagChange;
   final VoidCallback onDelete;
 
   const _TodoCard({
     super.key,
     required this.index,
     required this.todo,
+    required this.tags,
+    required this.selectedTag,
     required this.onStatusChange,
+    required this.onTagChange,
     required this.onDelete,
   });
 
@@ -1253,18 +1599,30 @@ class _TodoCard extends StatelessWidget {
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: Text(
-                todo.text,
-                style: TextStyle(
-                  fontFamily: 'Jost',
-                  fontSize: 16,
-                  height: 1.3,
-                  decoration:
-                      isCompleted ? TextDecoration.lineThrough : null,
-                  decorationColor: Colors.grey.shade500,
-                  decorationThickness: 2,
-                  color: isCompleted ? Colors.grey.shade500 : kNavy,
-                ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    todo.text,
+                    style: TextStyle(
+                      fontFamily: 'Jost',
+                      fontSize: 16,
+                      height: 1.3,
+                      decoration:
+                          isCompleted ? TextDecoration.lineThrough : null,
+                      decorationColor: Colors.grey.shade500,
+                      decorationThickness: 2,
+                      color: isCompleted ? Colors.grey.shade500 : kNavy,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  _TagPicker(
+                    tags: tags,
+                    selected: selectedTag,
+                    onChanged: onTagChange,
+                  ),
+                ],
               ),
             ),
             IconButton(
@@ -1357,4 +1715,701 @@ class _StatusChip extends StatelessWidget {
       ),
     );
   }
+}
+
+// Small "# / %" segmented toggle for breakdown display mode.
+class _CountPercentToggle extends StatelessWidget {
+  final bool asPercent;
+  final ValueChanged<bool> onChanged;
+
+  const _CountPercentToggle({required this.asPercent, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: kSurfaceMuted,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: kBorderSubtle),
+      ),
+      padding: const EdgeInsets.all(2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _segment('#', !asPercent, () => onChanged(false)),
+          _segment('%', asPercent, () => onChanged(true)),
+        ],
+      ),
+    );
+  }
+
+  Widget _segment(String label, bool active, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        decoration: BoxDecoration(
+          color: active ? kNavy : Colors.transparent,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontFamily: 'Jost',
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: active ? Colors.white : Colors.grey.shade600,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// A compact pill showing one tag's name + value in a breakdown strip.
+class _TagStatChip extends StatelessWidget {
+  final Color color;
+  final String label;
+  final String value;
+
+  const _TagStatChip({
+    required this.color,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 9,
+            height: 9,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 7),
+          Text(
+            label,
+            style: const TextStyle(
+              fontFamily: 'Jost',
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: kNavy,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            value,
+            style: TextStyle(
+              fontFamily: 'Jost',
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: color.computeLuminance() > 0.6 ? kNavy : color,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Per-todo tag assignment control. Uses -1 as the "no tag" sentinel.
+class _TagPicker extends StatelessWidget {
+  final List<Tag> tags;
+  final Tag? selected;
+  final ValueChanged<int?> onChanged;
+
+  const _TagPicker({
+    required this.tags,
+    required this.selected,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<int>(
+      tooltip: 'Assign objective',
+      offset: const Offset(0, 36),
+      shape:
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      onSelected: (v) => onChanged(v == -1 ? null : v),
+      itemBuilder: (context) => [
+        ...tags.map(
+          (t) => PopupMenuItem<int>(
+            value: t.id,
+            child: Row(
+              children: [
+                Container(
+                  width: 10,
+                  height: 10,
+                  decoration:
+                      BoxDecoration(color: t.color, shape: BoxShape.circle),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  t.name,
+                  style: TextStyle(
+                    fontFamily: 'Jost',
+                    fontSize: 14,
+                    fontWeight: selected?.id == t.id
+                        ? FontWeight.w700
+                        : FontWeight.w400,
+                    color: kNavy,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (tags.isNotEmpty) const PopupMenuDivider(),
+        const PopupMenuItem<int>(
+          value: -1,
+          child: Text(
+            'No objective',
+            style: TextStyle(
+              fontFamily: 'Jost',
+              fontSize: 14,
+              color: kUntaggedGrey,
+            ),
+          ),
+        ),
+      ],
+      child: selected == null
+          ? Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: kBorderSubtle),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.add, size: 13, color: Colors.grey.shade500),
+                  const SizedBox(width: 3),
+                  Text(
+                    'Objective',
+                    style: TextStyle(
+                      fontFamily: 'Jost',
+                      fontSize: 12,
+                      color: Colors.grey.shade500,
+                    ),
+                  ),
+                ],
+              ),
+            )
+          : Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: selected!.color.withOpacity(0.14),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                        color: selected!.color, shape: BoxShape.circle),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    selected!.name,
+                    style: const TextStyle(
+                      fontFamily: 'Jost',
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: kNavy,
+                    ),
+                  ),
+                  const SizedBox(width: 2),
+                  Icon(Icons.expand_more,
+                      size: 14, color: Colors.grey.shade500),
+                ],
+              ),
+            ),
+    );
+  }
+}
+
+// "Overall Objectives" bottom sheet: edit tags + see the long-range breakdown.
+class _ObjectivesSheet extends StatefulWidget {
+  final List<Tag> Function() getTags;
+  final bool percentMode;
+  final ValueChanged<bool> onPercentModeChanged;
+  final Future<void> Function(String) onAddTag;
+  final Future<void> Function(Tag, String) onRenameTag;
+  final Future<void> Function(Tag) onRemoveTag;
+  final Future<List<TagStat>> Function(int days) fetchRangeStats;
+
+  const _ObjectivesSheet({
+    required this.getTags,
+    required this.percentMode,
+    required this.onPercentModeChanged,
+    required this.onAddTag,
+    required this.onRenameTag,
+    required this.onRemoveTag,
+    required this.fetchRangeStats,
+  });
+
+  @override
+  State<_ObjectivesSheet> createState() => _ObjectivesSheetState();
+}
+
+class _ObjectivesSheetState extends State<_ObjectivesSheet> {
+  static const List<int> _presets = [7, 14, 30, 90];
+
+  final TextEditingController _newTagController = TextEditingController();
+  late bool _percent = widget.percentMode;
+  int _rangeDays = 30;
+  List<TagStat> _stats = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshStats();
+  }
+
+  @override
+  void dispose() {
+    _newTagController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _refreshStats() async {
+    setState(() => _loading = true);
+    final stats = await widget.fetchRangeStats(_rangeDays);
+    if (!mounted) return;
+    setState(() {
+      _stats = stats;
+      _loading = false;
+    });
+  }
+
+  Future<void> _handleAdd() async {
+    final name = _newTagController.text.trim();
+    if (name.isEmpty) return;
+    _newTagController.clear();
+    await widget.onAddTag(name);
+    await _refreshStats();
+  }
+
+  Future<void> _handleRename(Tag tag) async {
+    final name = await _promptText(
+      context,
+      title: 'Rename objective',
+      initial: tag.name,
+    );
+    if (name == null || name.trim().isEmpty) return;
+    await widget.onRenameTag(tag, name);
+    await _refreshStats();
+  }
+
+  Future<void> _handleDelete(Tag tag) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Delete objective?',
+            style: TextStyle(fontFamily: 'Jost', fontWeight: FontWeight.w700)),
+        content: Text(
+          'Todos tagged "${tag.name}" will become untagged. This can\'t be undone.',
+          style: const TextStyle(fontFamily: 'Jost'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel',
+                style: TextStyle(fontFamily: 'Jost', color: kNavy)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete',
+                style: TextStyle(
+                    fontFamily: 'Jost', color: Color(0xFFE0457B))),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await widget.onRemoveTag(tag);
+    await _refreshStats();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tags = widget.getTags();
+    final totalCompleted =
+        _stats.fold<int>(0, (sum, s) => sum + s.completed);
+
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.85,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 10),
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: kBorderSubtle,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
+              child: Row(
+                children: [
+                  const Icon(Icons.track_changes, color: kNavy, size: 22),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Text(
+                      'Overall Objectives',
+                      style: TextStyle(
+                        fontFamily: 'Bungee',
+                        fontSize: 18,
+                        color: kNavy,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.close_rounded,
+                        color: Colors.grey.shade600),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(20, 6, 20, 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _sectionLabel('YOUR TAGS'),
+                    const SizedBox(height: 8),
+                    if (tags.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Text(
+                          'No objectives yet. Add a long-term goal below — e.g. "Fitness", "Reading", "Side project".',
+                          style: TextStyle(
+                            fontFamily: 'Jost',
+                            fontSize: 14,
+                            color: Colors.grey.shade600,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    ...tags.map(_buildTagRow),
+                    const SizedBox(height: 12),
+                    _buildAddRow(),
+                    const SizedBox(height: 24),
+                    Row(
+                      children: [
+                        _sectionLabel('PROGRESS'),
+                        const Spacer(),
+                        _CountPercentToggle(
+                          asPercent: _percent,
+                          onChanged: (v) {
+                            setState(() => _percent = v);
+                            widget.onPercentModeChanged(v);
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    _buildRangeSelector(),
+                    const SizedBox(height: 14),
+                    if (_loading)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 24),
+                        child: Center(
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.4,
+                            valueColor:
+                                AlwaysStoppedAnimation<Color>(kGreen),
+                          ),
+                        ),
+                      )
+                    else if (_stats.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        child: Text(
+                          'No todos in the last $_rangeDays days.',
+                          style: TextStyle(
+                            fontFamily: 'Jost',
+                            fontSize: 14,
+                            color: Colors.grey.shade600,
+                          ),
+                        ),
+                      )
+                    else
+                      ..._stats.map(
+                          (s) => _buildProgressRow(s, totalCompleted)),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _sectionLabel(String text) => Text(
+        text,
+        style: TextStyle(
+          fontFamily: 'Jost',
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 1.2,
+          color: Colors.grey.shade500,
+        ),
+      );
+
+  Widget _buildTagRow(Tag tag) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Container(
+            width: 14,
+            height: 14,
+            decoration:
+                BoxDecoration(color: tag.color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              tag.name,
+              style: const TextStyle(
+                fontFamily: 'Jost',
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                color: kNavy,
+              ),
+            ),
+          ),
+          IconButton(
+            icon: Icon(Icons.edit_outlined,
+                size: 19, color: Colors.grey.shade600),
+            tooltip: 'Rename',
+            onPressed: () => _handleRename(tag),
+          ),
+          IconButton(
+            icon: Icon(Icons.delete_outline,
+                size: 19, color: Colors.grey.shade600),
+            tooltip: 'Delete',
+            onPressed: () => _handleDelete(tag),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAddRow() {
+    return Row(
+      children: [
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              color: kSurfaceMuted,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: kBorderSubtle),
+            ),
+            child: TextField(
+              controller: _newTagController,
+              decoration: const InputDecoration(
+                hintText: 'New objective…',
+                border: InputBorder.none,
+                contentPadding:
+                    EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                hintStyle: TextStyle(
+                  fontFamily: 'Jost',
+                  fontSize: 15,
+                  color: Color(0xFF8A94A6),
+                ),
+              ),
+              style: const TextStyle(
+                  fontFamily: 'Jost', fontSize: 15, color: kNavy),
+              onSubmitted: (_) => _handleAdd(),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Material(
+          color: kGreen,
+          borderRadius: BorderRadius.circular(12),
+          child: InkWell(
+            onTap: _handleAdd,
+            borderRadius: BorderRadius.circular(12),
+            child: const SizedBox(
+              width: 46,
+              height: 46,
+              child: Icon(Icons.add, color: Colors.white, size: 24),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRangeSelector() {
+    return Wrap(
+      spacing: 8,
+      children: _presets.map((d) {
+        final active = d == _rangeDays;
+        return GestureDetector(
+          onTap: () {
+            setState(() => _rangeDays = d);
+            _refreshStats();
+          },
+          child: Container(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+            decoration: BoxDecoration(
+              color: active ? kNavy : kSurfaceMuted,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                  color: active ? kNavy : kBorderSubtle),
+            ),
+            child: Text(
+              '$d days',
+              style: TextStyle(
+                fontFamily: 'Jost',
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: active ? Colors.white : Colors.grey.shade700,
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _buildProgressRow(TagStat s, int totalCompleted) {
+    final fraction = s.total == 0 ? 0.0 : s.completed / s.total;
+    final trailing = _percent
+        ? (totalCompleted == 0
+            ? '0%'
+            : '${(s.completed / totalCompleted * 100).round()}%')
+        : '${s.completed}/${s.total}';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 11,
+                height: 11,
+                decoration:
+                    BoxDecoration(color: s.color, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  s.label,
+                  style: const TextStyle(
+                    fontFamily: 'Jost',
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: kNavy,
+                  ),
+                ),
+              ),
+              Text(
+                trailing,
+                style: const TextStyle(
+                  fontFamily: 'Jost',
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  color: kNavy,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: LinearProgressIndicator(
+              value: _percent
+                  ? (totalCompleted == 0
+                      ? 0.0
+                      : s.completed / totalCompleted)
+                  : fraction,
+              minHeight: 6,
+              backgroundColor: kSurfaceMuted,
+              valueColor: AlwaysStoppedAnimation<Color>(s.color),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Future<String?> _promptText(
+  BuildContext context, {
+  required String title,
+  String initial = '',
+}) {
+  final controller = TextEditingController(text: initial);
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: Text(title,
+          style: const TextStyle(
+              fontFamily: 'Jost', fontWeight: FontWeight.w700, color: kNavy)),
+      content: TextField(
+        controller: controller,
+        autofocus: true,
+        style: const TextStyle(fontFamily: 'Jost', color: kNavy),
+        decoration: const InputDecoration(
+          border: OutlineInputBorder(),
+          contentPadding:
+              EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+        ),
+        onSubmitted: (v) => Navigator.of(ctx).pop(v),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(),
+          child: const Text('Cancel',
+              style: TextStyle(fontFamily: 'Jost', color: kNavy)),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(controller.text),
+          child: const Text('Save',
+              style: TextStyle(
+                  fontFamily: 'Jost',
+                  color: kNavy,
+                  fontWeight: FontWeight.w700)),
+        ),
+      ],
+    ),
+  );
 }
