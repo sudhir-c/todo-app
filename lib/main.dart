@@ -87,12 +87,32 @@ enum TodoStatus {
   }
 }
 
+enum RecurFreq {
+  daily,
+  weekdays;
+
+  String toCode() => this == RecurFreq.daily ? 'daily' : 'weekdays';
+
+  static RecurFreq fromCode(String code) =>
+      code == 'weekdays' ? RecurFreq.weekdays : RecurFreq.daily;
+
+  String get label =>
+      this == RecurFreq.daily ? 'Every day' : 'Weekdays (Mon–Fri)';
+
+  // Whether an instance of this rule should appear on the given calendar date.
+  bool occursOn(DateTime date) {
+    if (this == RecurFreq.daily) return true;
+    return date.weekday >= DateTime.monday && date.weekday <= DateTime.friday;
+  }
+}
+
 class TodoItem {
   final int id;
   final TodoStatus status;
   final String description;
   final int dateId;
   final int? tagId;
+  final int? recurringId;
 
   const TodoItem({
     required this.id,
@@ -100,6 +120,7 @@ class TodoItem {
     required this.description,
     required this.dateId,
     this.tagId,
+    this.recurringId,
   });
 
   Map<String, Object?> toMap() {
@@ -109,12 +130,42 @@ class TodoItem {
       'description': description,
       'day_id': dateId,
       'tag_id': tagId,
+      'recurring_id': recurringId,
     };
   }
 
   @override
   String toString() {
-    return 'TodoItem{id: $id, status: $status, description: $description, dateId: $dateId, tagId: $tagId}';
+    return 'TodoItem{id: $id, status: $status, description: $description, dateId: $dateId, tagId: $tagId, recurringId: $recurringId}';
+  }
+}
+
+class RecurringRule {
+  final int id;
+  final String description;
+  final int? tagId;
+  final RecurFreq freq;
+  final int startDayId;
+  final int? endDayId; // inclusive; null => no end
+
+  const RecurringRule({
+    required this.id,
+    required this.description,
+    required this.tagId,
+    required this.freq,
+    required this.startDayId,
+    required this.endDayId,
+  });
+
+  Map<String, Object?> toMap() {
+    return {
+      'id': id,
+      'description': description,
+      'tag_id': tagId,
+      'freq': freq.toCode(),
+      'start_day_id': startDayId,
+      'end_day_id': endDayId,
+    };
   }
 }
 
@@ -195,10 +246,16 @@ void main() async {
         'CREATE TABLE days(id INTEGER PRIMARY KEY, date TEXT)',
       );
       await db.execute(
-        'CREATE TABLE todos(id INTEGER PRIMARY KEY, day_id INTEGER, is_completed INTEGER, description TEXT, tag_id INTEGER)',
+        'CREATE TABLE todos(id INTEGER PRIMARY KEY, day_id INTEGER, is_completed INTEGER, description TEXT, tag_id INTEGER, recurring_id INTEGER)',
       );
       await db.execute(
         'CREATE TABLE tags(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, color INTEGER, position INTEGER)',
+      );
+      await db.execute(
+        'CREATE TABLE recurring(id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT, tag_id INTEGER, freq TEXT, start_day_id INTEGER, end_day_id INTEGER)',
+      );
+      await db.execute(
+        'CREATE TABLE recurring_skips(recurring_id INTEGER, day_id INTEGER)',
       );
     },
     onUpgrade: (db, oldVersion, newVersion) async {
@@ -210,8 +267,19 @@ void main() async {
           'CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, color INTEGER, position INTEGER)',
         );
       }
+      // v2 -> v3: introduce recurring tasks. Additive — existing todos gain a
+      // NULL recurring_id, plus two new tables for rules and per-day skips.
+      if (oldVersion < 3) {
+        await db.execute('ALTER TABLE todos ADD COLUMN recurring_id INTEGER');
+        await db.execute(
+          'CREATE TABLE IF NOT EXISTS recurring(id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT, tag_id INTEGER, freq TEXT, start_day_id INTEGER, end_day_id INTEGER)',
+        );
+        await db.execute(
+          'CREATE TABLE IF NOT EXISTS recurring_skips(recurring_id INTEGER, day_id INTEGER)',
+        );
+      }
     },
-    version: 2,
+    version: 3,
   );
 
   runApp(const DailyTodoApp());
@@ -263,7 +331,8 @@ Future<List<TodoItem>> todoItems() async {
       'day_id': dayId as int,
       'is_completed': isCompleted as int,
       'description': description as String,
-      'tag_id': tagId as int?
+      'tag_id': tagId as int?,
+      'recurring_id': recurringId as int?
     } in todoMaps)
       TodoItem(
         id: id,
@@ -271,6 +340,7 @@ Future<List<TodoItem>> todoItems() async {
         status: TodoStatus.fromCode(isCompleted),
         description: description,
         tagId: tagId,
+        recurringId: recurringId,
       ),
   ];
 }
@@ -288,7 +358,8 @@ Future<List<TodoItem>> todoItemsForDay(int dayId) async {
       'day_id': dayId as int,
       'is_completed': isCompleted as int,
       'description': description as String,
-      'tag_id': tagId as int?
+      'tag_id': tagId as int?,
+      'recurring_id': recurringId as int?
     } in todoMaps)
       TodoItem(
         id: id,
@@ -296,6 +367,7 @@ Future<List<TodoItem>> todoItemsForDay(int dayId) async {
         status: TodoStatus.fromCode(isCompleted),
         description: description,
         tagId: tagId,
+        recurringId: recurringId,
       ),
   ];
 }
@@ -314,7 +386,8 @@ Future<List<TodoItem>> todoItemsForDayRange(int startDayId, int endDayId) async 
       'day_id': dayId as int,
       'is_completed': isCompleted as int,
       'description': description as String,
-      'tag_id': tagId as int?
+      'tag_id': tagId as int?,
+      'recurring_id': recurringId as int?
     } in todoMaps)
       TodoItem(
         id: id,
@@ -322,6 +395,7 @@ Future<List<TodoItem>> todoItemsForDayRange(int startDayId, int endDayId) async 
         status: TodoStatus.fromCode(isCompleted),
         description: description,
         tagId: tagId,
+        recurringId: recurringId,
       ),
   ];
 }
@@ -393,6 +467,82 @@ Future<void> updateTodoTag(int todoId, int? tagId) async {
   );
 }
 
+// Reassigns a todo to a different day (used by rollover — a true move).
+Future<void> moveTodoToDay(int todoId, int newDayId) async {
+  final db = await database;
+  await db.update(
+    'todos',
+    {'day_id': newDayId},
+    where: 'id = ?',
+    whereArgs: [todoId],
+  );
+}
+
+Future<List<RecurringRule>> recurringAll() async {
+  final db = await database;
+  final List<Map<String, Object?>> maps =
+      await db.query('recurring', orderBy: 'id ASC');
+  return [
+    for (final {
+      'id': id as int,
+      'description': description as String,
+      'tag_id': tagId as int?,
+      'freq': freq as String,
+      'start_day_id': startDayId as int,
+      'end_day_id': endDayId as int?
+    } in maps)
+      RecurringRule(
+        id: id,
+        description: description,
+        tagId: tagId,
+        freq: RecurFreq.fromCode(freq),
+        startDayId: startDayId,
+        endDayId: endDayId,
+      ),
+  ];
+}
+
+Future<int> insertRecurring(RecurringRule rule) async {
+  final db = await database;
+  return await db.insert('recurring', {
+    'description': rule.description,
+    'tag_id': rule.tagId,
+    'freq': rule.freq.toCode(),
+    'start_day_id': rule.startDayId,
+    'end_day_id': rule.endDayId,
+  });
+}
+
+Future<void> updateRecurring(RecurringRule rule) async {
+  final db = await database;
+  await db.update(
+    'recurring',
+    rule.toMap(),
+    where: 'id = ?',
+    whereArgs: [rule.id],
+  );
+}
+
+Future<void> deleteRecurring(int ruleId) async {
+  final db = await database;
+  await db.delete('recurring', where: 'id = ?', whereArgs: [ruleId]);
+  await db
+      .delete('recurring_skips', where: 'recurring_id = ?', whereArgs: [ruleId]);
+}
+
+Future<Set<int>> recurringSkipsForDay(int dayId) async {
+  final db = await database;
+  final maps = await db
+      .query('recurring_skips', where: 'day_id = ?', whereArgs: [dayId]);
+  return {for (final m in maps) m['recurring_id'] as int};
+}
+
+Future<void> addRecurringSkip(int recurringId, int dayId) async {
+  final db = await database;
+  await db.insert(
+      'recurring_skips', {'recurring_id': recurringId, 'day_id': dayId});
+}
+
 class DailyTodoApp extends StatelessWidget {
   const DailyTodoApp({Key? key}) : super(key: key);
 
@@ -440,14 +590,27 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   List<Tag> _tags = [];
   bool _breakdownAsPercent = false;
 
+  // Recurring task rules (persisted).
+  List<RecurringRule> _recurringRules = [];
+
+  // Rollover: ids of yesterday's incomplete todos eligible to move to today,
+  // and the set of today-ids we've already prompted for this session.
+  List<int> _rolloverTodoIds = [];
+  final Set<int> _rolloverHandled = {};
+
   @override
   void initState() {
     super.initState();
     // Ensure current date is set to today's date (normalized to midnight)
     final now = DateTime.now();
     currentDate = DateTime(now.year, now.month, now.day);
-    loadTags();
-    loadTodosForCurrentDate();
+    _init();
+  }
+
+  Future<void> _init() async {
+    await loadTags();
+    await loadRecurring();
+    await loadTodosForCurrentDate();
   }
 
   Future<void> loadTags() async {
@@ -455,6 +618,17 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     if (!mounted) return;
     setState(() => _tags = loaded);
   }
+
+  Future<void> loadRecurring() async {
+    final loaded = await recurringAll();
+    if (!mounted) return;
+    setState(() => _recurringRules = loaded);
+  }
+
+  // The calendar date represented by a day id (inverse of getDayId).
+  DateTime dateFromDayId(int dayId) =>
+      DateTime(ZERO_DATE.year, ZERO_DATE.month, ZERO_DATE.day)
+          .add(Duration(days: dayId));
 
   Tag? tagById(int? id) {
     if (id == null) return null;
@@ -467,31 +641,79 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   Future<void> loadTodosForCurrentDate() async {
     int dayId = getDayId(currentDate);
     String dateKey = getDateKey(currentDate);
-    
-    print('Loading todos for date: $dateKey, dayId: $dayId');
-    
+
     List<TodoItem> dbTodos = await todoItemsForDay(dayId);
-    
+
+    // Counter base for any new ids we mint on this day.
+    int counter = 0;
+    if (dbTodos.isNotEmpty) {
+      counter =
+          dbTodos.map((t) => t.id % 10000).reduce((a, b) => a > b ? a : b) + 1;
+    }
+
+    // Materialize any due recurring instances not already present (or skipped).
+    final generated = await _generateRecurringForDay(dayId, dbTodos, counter);
+    if (generated.isNotEmpty) {
+      dbTodos = [...dbTodos, ...generated];
+      counter += generated.length;
+    }
+
+    if (!mounted) return;
     setState(() {
-      final key = getDateKey(currentDate);
-      todosByDate[key] = dbTodos.map((todoItem) =>
-        Todo(
-          text: todoItem.description,
-          status: todoItem.status,
-          tagId: todoItem.tagId,
-        )
-      ).toList();
-      
+      final key = dateKey;
+      todosByDate[key] = dbTodos
+          .map((todoItem) => Todo(
+                text: todoItem.description,
+                status: todoItem.status,
+                tagId: todoItem.tagId,
+                recurringId: todoItem.recurringId,
+              ))
+          .toList();
+
       todoIdsByDate[key] = dbTodos.map((todoItem) => todoItem.id).toList();
-      
-      // Update counter to avoid ID collisions
-      if (dbTodos.isNotEmpty) {
-        int maxLocalId = dbTodos.map((t) => t.id % 10000).reduce((a, b) => a > b ? a : b);
-        _todoCountersByDay[dayId] = maxLocalId + 1;
-      }
+      _todoCountersByDay[dayId] = counter;
     });
-    
-    print('Loaded ${dbTodos.length} todos for day $dayId (date: $dateKey)');
+
+    await _checkRollover();
+  }
+
+  // Inserts and returns recurring-task instances that are due on [dayId] but
+  // not yet present in [existing] and not skipped. [startCounter] seeds new ids.
+  Future<List<TodoItem>> _generateRecurringForDay(
+      int dayId, List<TodoItem> existing, int startCounter) async {
+    if (_recurringRules.isEmpty) return const [];
+
+    final presentRuleIds = existing
+        .map((t) => t.recurringId)
+        .whereType<int>()
+        .toSet();
+
+    final due = _recurringRules.where((r) {
+      if (presentRuleIds.contains(r.id)) return false;
+      if (dayId < r.startDayId) return false;
+      if (r.endDayId != null && dayId > r.endDayId!) return false;
+      return r.freq.occursOn(dateFromDayId(dayId));
+    }).toList();
+    if (due.isEmpty) return const [];
+
+    final skips = await recurringSkipsForDay(dayId);
+    final List<TodoItem> created = [];
+    int counter = startCounter;
+    for (final rule in due) {
+      if (skips.contains(rule.id)) continue;
+      final item = TodoItem(
+        id: (dayId * 10000) + counter,
+        dateId: dayId,
+        status: TodoStatus.notStarted,
+        description: rule.description,
+        tagId: rule.tagId,
+        recurringId: rule.id,
+      );
+      counter++;
+      await insertTodoItem(item);
+      created.add(item);
+    }
+    return created;
   }
 
   String getDateKey(DateTime date) => DateFormat('yyyy-MM-dd').format(date);
@@ -547,6 +769,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
         status: todo.status,
         description: todo.text,
         tagId: todo.tagId,
+        recurringId: todo.recurringId,
       );
 
       await updateTodoItem(todoItem);
@@ -571,16 +794,24 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 
   void deleteTodo(int index) async {
     final key = getDateKey(currentDate);
-    
+    final todo = todosByDate[key]![index];
+    final dayId = getDayId(currentDate);
+
     // Get the todo ID if it exists
-    if (todoIdsByDate.containsKey(key) && 
+    if (todoIdsByDate.containsKey(key) &&
         index < todoIdsByDate[key]!.length &&
         todoIdsByDate[key]![index] != -1) {
       int todoId = todoIdsByDate[key]![index];
       await deleteTodoItem(todoId);
       print('Deleted todo with ID: $todoId');
     }
-    
+
+    // If this was a recurring instance, remember the skip so it doesn't
+    // regenerate the next time this day is opened.
+    if (todo.recurringId != null) {
+      await addRecurringSkip(todo.recurringId!, dayId);
+    }
+
     setState(() {
       todosByDate[key]!.removeAt(index);
       if (todoIdsByDate.containsKey(key) && index < todoIdsByDate[key]!.length) {
@@ -633,6 +864,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
         status: todo.status,
         description: todo.text,
         tagId: todo.tagId,
+        recurringId: todo.recurringId,
       );
       await insertTodoItem(todoItem);
     }
@@ -664,6 +896,110 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
       currentDate = DateTime.now();
     });
     await loadTodosForCurrentDate();
+  }
+
+  // ---- Rollover -----------------------------------------------------------
+
+  // Finds yesterday's incomplete, non-recurring todos when today is open.
+  Future<void> _checkRollover() async {
+    final isToday = getDateKey(currentDate) == getDateKey(DateTime.now());
+    if (!isToday) {
+      if (_rolloverTodoIds.isNotEmpty) {
+        setState(() => _rolloverTodoIds = []);
+      }
+      return;
+    }
+
+    final todayId = getDayId(DateTime.now());
+    if (_rolloverHandled.contains(todayId)) return;
+
+    final prev = await todoItemsForDay(todayId - 1);
+    final candidates = prev
+        .where((t) =>
+            t.status != TodoStatus.completed && t.recurringId == null)
+        .map((t) => t.id)
+        .toList();
+
+    if (!mounted) return;
+    setState(() => _rolloverTodoIds = candidates);
+  }
+
+  Future<void> _doRollover() async {
+    final todayId = getDayId(DateTime.now());
+    for (final id in _rolloverTodoIds) {
+      await moveTodoToDay(id, todayId);
+    }
+    _rolloverHandled.add(todayId);
+    setState(() => _rolloverTodoIds = []);
+    await loadTodosForCurrentDate();
+  }
+
+  void _dismissRollover() {
+    _rolloverHandled.add(getDayId(DateTime.now()));
+    setState(() => _rolloverTodoIds = []);
+  }
+
+  // ---- Recurring rules ----------------------------------------------------
+
+  Future<void> addRecurring(
+      String description, RecurFreq freq, int? tagId, int? endDayId) async {
+    final trimmed = description.trim();
+    if (trimmed.isEmpty) return;
+    await insertRecurring(RecurringRule(
+      id: 0,
+      description: trimmed,
+      tagId: tagId,
+      freq: freq,
+      startDayId: getDayId(DateTime.now()),
+      endDayId: endDayId,
+    ));
+    await loadRecurring();
+    // Surface today's instance immediately if it's due.
+    await loadTodosForCurrentDate();
+  }
+
+  Future<void> updateRecurringRule(RecurringRule rule) async {
+    await updateRecurring(rule);
+    await loadRecurring();
+    await loadTodosForCurrentDate();
+  }
+
+  Future<void> removeRecurring(RecurringRule rule) async {
+    await deleteRecurring(rule.id);
+    await loadRecurring();
+  }
+
+  Future<void> openRecurringManager() async {
+    await pushDayAndTodos();
+    if (!mounted) return;
+
+    await showDialog(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (_) => Dialog(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 32, vertical: 32),
+        backgroundColor: Colors.white,
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: 720,
+            maxHeight: MediaQuery.of(context).size.height * 0.9,
+          ),
+          child: _RecurringManagerDialog(
+            getRules: () => _recurringRules,
+            tags: _tags,
+            tagById: tagById,
+            dayIdFromDate: getDayId,
+            dateFromDayId: dateFromDayId,
+            onAdd: addRecurring,
+            onUpdate: updateRecurringRule,
+            onDelete: removeRecurring,
+          ),
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
   }
 
   Future<void> addTag(String name) async {
@@ -1086,6 +1422,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
           children: [
             _buildHeader(isToday, todos.length, completedCount, progress),
             _buildAddTodoBar(),
+            _buildRolloverBanner(),
             _buildDayBreakdown(todos),
             Expanded(
               child: todos.isEmpty
@@ -1237,7 +1574,26 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
               ),
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
+          Material(
+            color: kSurfaceMuted,
+            borderRadius: BorderRadius.circular(14),
+            child: InkWell(
+              onTap: openRecurringManager,
+              borderRadius: BorderRadius.circular(14),
+              child: Container(
+                width: 50,
+                height: 50,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: kBorderSubtle),
+                ),
+                child: const Icon(Icons.repeat, color: kNavy, size: 24),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
           Material(
             color: kGreen,
             borderRadius: BorderRadius.circular(14),
@@ -1253,6 +1609,72 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildRolloverBanner() {
+    if (_rolloverTodoIds.isEmpty) return const SizedBox.shrink();
+    final n = _rolloverTodoIds.length;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 6, 20, 2),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
+        decoration: BoxDecoration(
+          color: const Color.fromRGBO(0, 42, 92, 0.06),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color.fromRGBO(0, 42, 92, 0.15)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.history_toggle_off, color: kNavy, size: 22),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                '$n unfinished ${n == 1 ? 'task' : 'tasks'} from yesterday',
+                style: const TextStyle(
+                  fontFamily: 'Jost',
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: kNavy,
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: _dismissRollover,
+              child: Text(
+                'Dismiss',
+                style: TextStyle(
+                  fontFamily: 'Jost',
+                  color: Colors.grey.shade600,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            Material(
+              color: kGreen,
+              borderRadius: BorderRadius.circular(10),
+              child: InkWell(
+                onTap: _doRollover,
+                borderRadius: BorderRadius.circular(10),
+                child: const Padding(
+                  padding:
+                      EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  child: Text(
+                    'Roll over',
+                    style: TextStyle(
+                      fontFamily: 'Jost',
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1410,11 +1832,13 @@ class Todo {
   String text;
   TodoStatus status;
   int? tagId;
+  int? recurringId;
 
   Todo({
     required this.text,
     this.status = TodoStatus.notStarted,
     this.tagId,
+    this.recurringId,
   });
 }
 
@@ -1634,10 +2058,23 @@ class _TodoCard extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 6),
-                  _TagPicker(
-                    tags: tags,
-                    selected: selectedTag,
-                    onChanged: onTagChange,
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _TagPicker(
+                        tags: tags,
+                        selected: selectedTag,
+                        onChanged: onTagChange,
+                      ),
+                      if (todo.recurringId != null) ...[
+                        const SizedBox(width: 6),
+                        Tooltip(
+                          message: 'Recurring task',
+                          child: Icon(Icons.repeat,
+                              size: 15, color: Colors.grey.shade500),
+                        ),
+                      ],
+                    ],
                   ),
                 ],
               ),
@@ -2420,4 +2857,458 @@ Future<String?> _promptText(
       ],
     ),
   );
+}
+
+// "Recurring Tasks" dialog: create rules, edit their end date, or delete them.
+class _RecurringManagerDialog extends StatefulWidget {
+  final List<RecurringRule> Function() getRules;
+  final List<Tag> tags;
+  final Tag? Function(int?) tagById;
+  final int Function(DateTime) dayIdFromDate;
+  final DateTime Function(int) dateFromDayId;
+  final Future<void> Function(String, RecurFreq, int?, int?) onAdd;
+  final Future<void> Function(RecurringRule) onUpdate;
+  final Future<void> Function(RecurringRule) onDelete;
+
+  const _RecurringManagerDialog({
+    required this.getRules,
+    required this.tags,
+    required this.tagById,
+    required this.dayIdFromDate,
+    required this.dateFromDayId,
+    required this.onAdd,
+    required this.onUpdate,
+    required this.onDelete,
+  });
+
+  @override
+  State<_RecurringManagerDialog> createState() =>
+      _RecurringManagerDialogState();
+}
+
+class _RecurringManagerDialogState extends State<_RecurringManagerDialog> {
+  final TextEditingController _descController = TextEditingController();
+  RecurFreq _freq = RecurFreq.daily;
+  int? _tagId;
+  DateTime? _endDate;
+
+  @override
+  void dispose() {
+    _descController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickEndDate({DateTime? initial}) async {
+    final now = DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial ?? now.add(const Duration(days: 30)),
+      firstDate: now,
+      lastDate: DateTime(now.year + 5),
+    );
+    if (picked != null) {
+      setState(() => _endDate = DateTime(picked.year, picked.month, picked.day));
+    }
+  }
+
+  Future<void> _handleAdd() async {
+    final desc = _descController.text.trim();
+    if (desc.isEmpty) return;
+    final endDayId = _endDate == null ? null : widget.dayIdFromDate(_endDate!);
+    await widget.onAdd(desc, _freq, _tagId, endDayId);
+    if (!mounted) return;
+    setState(() {
+      _descController.clear();
+      _freq = RecurFreq.daily;
+      _tagId = null;
+      _endDate = null;
+    });
+  }
+
+  Future<void> _editEndDate(RecurringRule rule) async {
+    final current =
+        rule.endDayId == null ? null : widget.dateFromDayId(rule.endDayId!);
+    final now = DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: current ?? now.add(const Duration(days: 30)),
+      firstDate: now,
+      lastDate: DateTime(now.year + 5),
+    );
+    if (picked == null) return;
+    await widget.onUpdate(RecurringRule(
+      id: rule.id,
+      description: rule.description,
+      tagId: rule.tagId,
+      freq: rule.freq,
+      startDayId: rule.startDayId,
+      endDayId: widget.dayIdFromDate(picked),
+    ));
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _clearEndDate(RecurringRule rule) async {
+    await widget.onUpdate(RecurringRule(
+      id: rule.id,
+      description: rule.description,
+      tagId: rule.tagId,
+      freq: rule.freq,
+      startDayId: rule.startDayId,
+      endDayId: null,
+    ));
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rules = widget.getRules();
+
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.max,
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(28, 24, 16, 16),
+            decoration: const BoxDecoration(
+              border: Border(bottom: BorderSide(color: kBorderSubtle)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.repeat, color: kNavy, size: 26),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                    'Recurring Tasks',
+                    style: TextStyle(
+                        fontFamily: 'Bungee', fontSize: 22, color: kNavy),
+                  ),
+                ),
+                IconButton(
+                  icon: Icon(Icons.close_rounded, color: Colors.grey.shade600),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(28, 20, 28, 28),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _label('ACTIVE RULES'),
+                  const SizedBox(height: 8),
+                  if (rules.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      child: Text(
+                        'No recurring tasks yet. Create one below — it will appear automatically on each matching day.',
+                        style: TextStyle(
+                          fontFamily: 'Jost',
+                          fontSize: 14,
+                          color: Colors.grey.shade600,
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                  ...rules.map(_buildRuleRow),
+                  const SizedBox(height: 26),
+                  _label('NEW RECURRING TASK'),
+                  const SizedBox(height: 12),
+                  _buildCreateForm(),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _label(String text) => Text(
+        text,
+        style: TextStyle(
+          fontFamily: 'Jost',
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 1.2,
+          color: Colors.grey.shade500,
+        ),
+      );
+
+  Widget _buildRuleRow(RecurringRule rule) {
+    final tag = widget.tagById(rule.tagId);
+    final endText = rule.endDayId == null
+        ? 'No end date'
+        : 'Until ${DateFormat('MMM d, yyyy').format(widget.dateFromDayId(rule.endDayId!))}';
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 5),
+      padding: const EdgeInsets.fromLTRB(14, 12, 6, 12),
+      decoration: BoxDecoration(
+        color: kSurfaceMuted,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: kBorderSubtle),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        rule.description,
+                        style: const TextStyle(
+                          fontFamily: 'Jost',
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: kNavy,
+                        ),
+                      ),
+                    ),
+                    if (tag != null) ...[
+                      const SizedBox(width: 8),
+                      Container(
+                        width: 9,
+                        height: 9,
+                        decoration: BoxDecoration(
+                            color: tag.color, shape: BoxShape.circle),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  '${rule.freq.label} · $endText',
+                  style: TextStyle(
+                    fontFamily: 'Jost',
+                    fontSize: 12.5,
+                    color: Colors.grey.shade600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'Edit',
+            icon: Icon(Icons.more_vert, color: Colors.grey.shade600),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12)),
+            onSelected: (v) {
+              if (v == 'end') _editEndDate(rule);
+              if (v == 'clear') _clearEndDate(rule);
+              if (v == 'delete') widget.onDelete(rule).then((_) {
+                    if (mounted) setState(() {});
+                  });
+            },
+            itemBuilder: (_) => [
+              const PopupMenuItem(
+                value: 'end',
+                child: Text('Set end date',
+                    style: TextStyle(fontFamily: 'Jost')),
+              ),
+              if (rule.endDayId != null)
+                const PopupMenuItem(
+                  value: 'clear',
+                  child: Text('Remove end date',
+                      style: TextStyle(fontFamily: 'Jost')),
+                ),
+              const PopupMenuItem(
+                value: 'delete',
+                child: Text('Delete',
+                    style: TextStyle(
+                        fontFamily: 'Jost', color: Color(0xFFE0457B))),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCreateForm() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          decoration: BoxDecoration(
+            color: kSurfaceMuted,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: kBorderSubtle),
+          ),
+          child: TextField(
+            controller: _descController,
+            decoration: const InputDecoration(
+              hintText: 'Task description…',
+              border: InputBorder.none,
+              contentPadding:
+                  EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+              hintStyle: TextStyle(
+                fontFamily: 'Jost',
+                fontSize: 15,
+                color: Color(0xFF8A94A6),
+              ),
+            ),
+            style: const TextStyle(
+                fontFamily: 'Jost', fontSize: 15, color: kNavy),
+            onSubmitted: (_) => _handleAdd(),
+          ),
+        ),
+        const SizedBox(height: 14),
+        Text('Repeats',
+            style: TextStyle(
+                fontFamily: 'Jost',
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: Colors.grey.shade700)),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          children: RecurFreq.values.map((f) {
+            final active = f == _freq;
+            return GestureDetector(
+              onTap: () => setState(() => _freq = f),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                decoration: BoxDecoration(
+                  color: active ? kNavy : kSurfaceMuted,
+                  borderRadius: BorderRadius.circular(20),
+                  border:
+                      Border.all(color: active ? kNavy : kBorderSubtle),
+                ),
+                child: Text(
+                  f.label,
+                  style: TextStyle(
+                    fontFamily: 'Jost',
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: active ? Colors.white : Colors.grey.shade700,
+                  ),
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+        if (widget.tags.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          Text('Objective (optional)',
+              style: TextStyle(
+                  fontFamily: 'Jost',
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey.shade700)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _tagChoice(null, 'None', null),
+              ...widget.tags
+                  .map((t) => _tagChoice(t.id, t.name, t.color)),
+            ],
+          ),
+        ],
+        const SizedBox(height: 14),
+        Row(
+          children: [
+            Icon(Icons.event_outlined, size: 18, color: Colors.grey.shade600),
+            const SizedBox(width: 8),
+            Text(
+              _endDate == null
+                  ? 'No end date'
+                  : 'Ends ${DateFormat('MMM d, yyyy').format(_endDate!)}',
+              style: const TextStyle(
+                  fontFamily: 'Jost', fontSize: 14, color: kNavy),
+            ),
+            const Spacer(),
+            if (_endDate != null)
+              TextButton(
+                onPressed: () => setState(() => _endDate = null),
+                child: Text('Clear',
+                    style: TextStyle(
+                        fontFamily: 'Jost', color: Colors.grey.shade600)),
+              ),
+            TextButton(
+              onPressed: () => _pickEndDate(initial: _endDate),
+              child: const Text('Set end date',
+                  style: TextStyle(
+                      fontFamily: 'Jost',
+                      color: kNavy,
+                      fontWeight: FontWeight.w600)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: Material(
+            color: kGreen,
+            borderRadius: BorderRadius.circular(12),
+            child: InkWell(
+              onTap: _handleAdd,
+              borderRadius: BorderRadius.circular(12),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(vertical: 14),
+                child: Text(
+                  'Add recurring task',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontFamily: 'Jost',
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _tagChoice(int? id, String label, Color? color) {
+    final active = _tagId == id;
+    return GestureDetector(
+      onTap: () => setState(() => _tagId = id),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: active ? kNavy : kSurfaceMuted,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: active ? kNavy : kBorderSubtle),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (color != null) ...[
+              Container(
+                width: 9,
+                height: 9,
+                decoration:
+                    BoxDecoration(color: color, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 6),
+            ],
+            Text(
+              label,
+              style: TextStyle(
+                fontFamily: 'Jost',
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: active ? Colors.white : Colors.grey.shade700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
