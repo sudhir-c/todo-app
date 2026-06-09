@@ -715,10 +715,16 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
       if (item.status == TodoStatus.completed) stat.completed++;
     }
     final stats = byTag.values.toList();
-    // Real tags first (alphabetical), Untagged last.
+    // Rank objectives by accomplishment: most completed first (which is also
+    // highest share-of-completed, since the denominator is constant per scope).
+    // Ties break on total, then name. The Untagged bucket always sinks last.
     stats.sort((a, b) {
       if (a.tagId == null) return 1;
       if (b.tagId == null) return -1;
+      final byCompleted = b.completed.compareTo(a.completed);
+      if (byCompleted != 0) return byCompleted;
+      final byTotal = b.total.compareTo(a.total);
+      if (byTotal != 0) return byTotal;
       return a.label.toLowerCase().compareTo(b.label.toLowerCase());
     });
     return stats;
@@ -729,28 +735,39 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     await pushDayAndTodos();
     if (!mounted) return;
 
-    await showModalBottomSheet(
+    await showDialog(
       context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.white,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (_) => _ObjectivesSheet(
-        getTags: () => _tags,
-        percentMode: _breakdownAsPercent,
-        onPercentModeChanged: (v) => setState(() => _breakdownAsPercent = v),
-        onAddTag: addTag,
-        onRenameTag: renameTag,
-        onRemoveTag: removeTag,
-        fetchRangeStats: (days) async {
-          final endDayId = getDayId(DateTime.now());
-          final startDayId = endDayId - (days - 1);
-          final items = await todoItemsForDayRange(startDayId, endDayId);
-          return computeTagStats(
-            items.map((i) => (tagId: i.tagId, status: i.status)),
-          );
-        },
+      barrierColor: Colors.black54,
+      builder: (_) => Dialog(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 32, vertical: 32),
+        backgroundColor: Colors.white,
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+        ),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: 720,
+            maxHeight: MediaQuery.of(context).size.height * 0.9,
+          ),
+          child: _ObjectivesSheet(
+            getTags: () => _tags,
+            percentMode: _breakdownAsPercent,
+            onPercentModeChanged: (v) =>
+                setState(() => _breakdownAsPercent = v),
+            onAddTag: addTag,
+            onRenameTag: renameTag,
+            onRemoveTag: removeTag,
+            fetchRangeStats: (days) async {
+              final endDayId = getDayId(DateTime.now());
+              final startDayId = endDayId - (days - 1);
+              final items = await todoItemsForDayRange(startDayId, endDayId);
+              return computeTagStats(
+                items.map((i) => (tagId: i.tagId, status: i.status)),
+              );
+            },
+          ),
+        ),
       ),
     );
     // Reflect any tag edits made inside the sheet.
@@ -2058,34 +2075,26 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
       padding: EdgeInsets.only(
         bottom: MediaQuery.of(context).viewInsets.bottom,
       ),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.of(context).size.height * 0.85,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 10),
+      child: Column(
+        mainAxisSize: MainAxisSize.max,
+        children: [
             Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(
-                color: kBorderSubtle,
-                borderRadius: BorderRadius.circular(2),
+              padding: const EdgeInsets.fromLTRB(28, 24, 16, 16),
+              decoration: const BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(color: kBorderSubtle, width: 1),
+                ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
               child: Row(
                 children: [
-                  const Icon(Icons.track_changes, color: kNavy, size: 22),
-                  const SizedBox(width: 10),
+                  const Icon(Icons.track_changes, color: kNavy, size: 26),
+                  const SizedBox(width: 12),
                   const Expanded(
                     child: Text(
                       'Overall Objectives',
                       style: TextStyle(
                         fontFamily: 'Bungee',
-                        fontSize: 18,
+                        fontSize: 22,
                         color: kNavy,
                       ),
                     ),
@@ -2098,9 +2107,9 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
                 ],
               ),
             ),
-            Flexible(
+            Expanded(
               child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(20, 6, 20, 24),
+                padding: const EdgeInsets.fromLTRB(28, 20, 28, 28),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -2171,8 +2180,7 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
             ),
           ],
         ),
-      ),
-    );
+      );
   }
 
   Widget _sectionLabel(String text) => Text(
