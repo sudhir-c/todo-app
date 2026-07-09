@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
@@ -7,6 +9,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:path/path.dart' show join;
 import 'package:sqflite/sqflite.dart';
+import 'firebase_options.dart';
+import 'auth_gate.dart';
 
 final DateTime ZERO_DATE = DateTime.utc(2026, 1, 24);
 
@@ -234,6 +238,9 @@ var database;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
   try {
     await dotenv.load(fileName: ".env");
   } catch (_) {
@@ -567,7 +574,7 @@ class DailyTodoApp extends StatelessWidget {
         splashFactory: InkSparkle.splashFactory,
         useMaterial3: true,
       ),
-      home: const DailyTodoPage(),
+      home: const AuthGate(),
     );
   }
 }
@@ -1435,6 +1442,54 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     );
   }
 
+  Widget _buildAccountButton() {
+    final email = FirebaseAuth.instance.currentUser?.email ?? 'Signed in';
+    return PopupMenuButton<String>(
+      tooltip: 'Account',
+      offset: const Offset(0, 44),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      onSelected: (v) async {
+        if (v == 'signout') {
+          await FirebaseAuth.instance.signOut();
+        }
+      },
+      itemBuilder: (_) => [
+        PopupMenuItem<String>(
+          enabled: false,
+          child: Text(
+            email,
+            style: TextStyle(
+              fontFamily: 'Jost',
+              fontSize: 13,
+              color: Colors.grey.shade600,
+            ),
+          ),
+        ),
+        const PopupMenuDivider(),
+        const PopupMenuItem<String>(
+          value: 'signout',
+          child: Row(
+            children: [
+              Icon(Icons.logout, size: 18, color: kNavy),
+              SizedBox(width: 10),
+              Text('Sign out',
+                  style: TextStyle(fontFamily: 'Jost', color: kNavy)),
+            ],
+          ),
+        ),
+      ],
+      child: Container(
+        width: 40,
+        height: 40,
+        decoration: const BoxDecoration(
+          color: kSurfaceMuted,
+          shape: BoxShape.circle,
+        ),
+        child: const Icon(Icons.person_outline, size: 22, color: kNavy),
+      ),
+    );
+  }
+
   Widget _buildHeader(
       bool isToday, int total, int completed, double progress) {
     final dayLabel = isToday
@@ -1466,6 +1521,8 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
                   children: [
                     Text(
                       dayLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         fontFamily: 'Bungee',
                         fontSize: 22,
@@ -1476,6 +1533,8 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
                     const SizedBox(height: 4),
                     Text(
                       dateLine,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontFamily: 'Jost',
                         fontSize: 13,
@@ -1486,6 +1545,8 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
                   ],
                 ),
               ),
+              const SizedBox(width: 8),
+              _buildAccountButton(),
               const SizedBox(width: 8),
               _RoundIconButton(
                 icon: Icons.track_changes,
