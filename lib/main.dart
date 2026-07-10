@@ -447,6 +447,9 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   final Map<String, List<Todo>> todosByDate = {};
   final TextEditingController todoController = TextEditingController();
 
+  // Live listener on the currently-viewed day's todos.
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _todosSub;
+
   // Objective tags (persisted) and how breakdowns are displayed.
   List<Tag> _tags = [];
   bool _breakdownAsPercent = false;
@@ -500,32 +503,45 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   }
 
   Future<void> loadTodosForCurrentDate() async {
-    int dayId = getDayId(currentDate);
-    String dateKey = getDateKey(currentDate);
+    final dayId = getDayId(currentDate);
 
-    List<TodoItem> dbTodos = await todoItemsForDay(dayId);
+    // Materialize any due recurring instances not already present (or skipped),
+    // based on a one-time read; the live listener then reflects them.
+    final existing = await todoItemsForDay(dayId);
+    await _generateRecurringForDay(dayId, existing);
 
-    // Materialize any due recurring instances not already present (or skipped).
-    final generated = await _generateRecurringForDay(dayId, dbTodos);
-    if (generated.isNotEmpty) {
-      dbTodos = [...dbTodos, ...generated];
-    }
-
-    if (!mounted) return;
-    setState(() {
-      todosByDate[dateKey] = dbTodos
-          .map((todoItem) => Todo(
-                id: todoItem.id,
-                text: todoItem.description,
-                status: todoItem.status,
-                tagId: todoItem.tagId,
-                recurringId: todoItem.recurringId,
-                order: todoItem.order,
-              ))
-          .toList();
-    });
+    // Drive the list from a live listener so edits from another device (or
+    // this one) appear automatically — no manual refresh needed.
+    _subscribeToCurrentDay();
 
     await _checkRollover();
+  }
+
+  // Subscribes to the current day's todos; each snapshot rebuilds the list.
+  void _subscribeToCurrentDay() {
+    _todosSub?.cancel();
+    final dayId = getDayId(currentDate);
+    final key = getDateKey(currentDate);
+    _todosSub = _todosCol
+        .where('day_id', isEqualTo: dayId)
+        .snapshots()
+        .listen((snap) {
+      final items = snap.docs.map(TodoItem.fromDoc).toList()
+        ..sort((a, b) => a.order.compareTo(b.order));
+      if (!mounted) return;
+      setState(() {
+        todosByDate[key] = items
+            .map((t) => Todo(
+                  id: t.id,
+                  text: t.description,
+                  status: t.status,
+                  tagId: t.tagId,
+                  recurringId: t.recurringId,
+                  order: t.order,
+                ))
+            .toList();
+      });
+    });
   }
 
   // Inserts and returns recurring-task instances that are due on [dayId] but
@@ -1632,14 +1648,17 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
         child: child,
       ),
       onReorder: (oldIndex, newIndex) {
+        if (newIndex > oldIndex) {
+          newIndex -= 1;
+        }
+        final key = getDateKey(currentDate);
+        final list = todosByDate[key]!;
         setState(() {
-          if (newIndex > oldIndex) {
-            newIndex -= 1;
-          }
-          final key = getDateKey(currentDate);
-          final todo = todosByDate[key]!.removeAt(oldIndex);
-          todosByDate[key]!.insert(newIndex, todo);
+          final todo = list.removeAt(oldIndex);
+          list.insert(newIndex, todo);
         });
+        // Persist the new order so it survives snapshots and syncs across devices.
+        _persistOrder(list);
       },
       itemBuilder: (context, index) {
         final todo = todos[index];
@@ -1657,8 +1676,20 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     );
   }
 
+  // Writes the current visual order to Firestore for the given day's todos.
+  Future<void> _persistOrder(List<Todo> list) async {
+    final batch = FirebaseFirestore.instance.batch();
+    for (int i = 0; i < list.length; i++) {
+      list[i].order = i;
+      final id = list[i].id;
+      if (id != null) batch.update(_todosCol.doc(id), {'order': i});
+    }
+    await batch.commit();
+  }
+
   @override
   void dispose() {
+    _todosSub?.cancel();
     todoController.dispose();
     super.dispose();
   }
