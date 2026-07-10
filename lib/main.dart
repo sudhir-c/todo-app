@@ -2,13 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'package:path/path.dart' show join;
-import 'package:sqflite/sqflite.dart';
 import 'firebase_options.dart';
 import 'auth_gate.dart';
 
@@ -111,12 +110,13 @@ enum RecurFreq {
 }
 
 class TodoItem {
-  final int id;
+  final String id;
   final TodoStatus status;
   final String description;
   final int dateId;
-  final int? tagId;
-  final int? recurringId;
+  final String? tagId;
+  final String? recurringId;
+  final int order;
 
   const TodoItem({
     required this.id,
@@ -125,17 +125,32 @@ class TodoItem {
     required this.dateId,
     this.tagId,
     this.recurringId,
+    this.order = 0,
   });
 
+  // Full document payload (used on create).
   Map<String, Object?> toMap() {
     return {
-      'id': id,
       'is_completed': status.toCode(),
       'description': description,
       'day_id': dateId,
       'tag_id': tagId,
       'recurring_id': recurringId,
+      'order': order,
     };
+  }
+
+  factory TodoItem.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final d = doc.data() ?? const {};
+    return TodoItem(
+      id: doc.id,
+      dateId: (d['day_id'] as num?)?.toInt() ?? 0,
+      status: TodoStatus.fromCode((d['is_completed'] as num?)?.toInt() ?? 0),
+      description: d['description'] as String? ?? '',
+      tagId: d['tag_id'] as String?,
+      recurringId: d['recurring_id'] as String?,
+      order: (d['order'] as num?)?.toInt() ?? 0,
+    );
   }
 
   @override
@@ -145,9 +160,9 @@ class TodoItem {
 }
 
 class RecurringRule {
-  final int id;
+  final String id;
   final String description;
-  final int? tagId;
+  final String? tagId;
   final RecurFreq freq;
   final int startDayId;
   final int? endDayId; // inclusive; null => no end
@@ -163,7 +178,6 @@ class RecurringRule {
 
   Map<String, Object?> toMap() {
     return {
-      'id': id,
       'description': description,
       'tag_id': tagId,
       'freq': freq.toCode(),
@@ -171,10 +185,22 @@ class RecurringRule {
       'end_day_id': endDayId,
     };
   }
+
+  factory RecurringRule.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final d = doc.data() ?? const {};
+    return RecurringRule(
+      id: doc.id,
+      description: d['description'] as String? ?? '',
+      tagId: d['tag_id'] as String?,
+      freq: RecurFreq.fromCode(d['freq'] as String? ?? 'daily'),
+      startDayId: (d['start_day_id'] as num?)?.toInt() ?? 0,
+      endDayId: (d['end_day_id'] as num?)?.toInt(),
+    );
+  }
 }
 
 class Tag {
-  final int id;
+  final String id;
   final String name;
   final int colorValue;
   final int position;
@@ -190,11 +216,20 @@ class Tag {
 
   Map<String, Object?> toMap() {
     return {
-      'id': id,
       'name': name,
       'color': colorValue,
       'position': position,
     };
+  }
+
+  factory Tag.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final d = doc.data() ?? const {};
+    return Tag(
+      id: doc.id,
+      name: d['name'] as String? ?? '',
+      colorValue: (d['color'] as num?)?.toInt() ?? 0xFF8A94A6,
+      position: (d['position'] as num?)?.toInt() ?? 0,
+    );
   }
 
   @override
@@ -203,7 +238,7 @@ class Tag {
 
 // Aggregated counts for one tag (or the Untagged bucket) within a scope.
 class TagStat {
-  final int? tagId;
+  final String? tagId;
   final String label;
   final Color color;
   int total;
@@ -218,336 +253,157 @@ class TagStat {
   });
 }
 
-class Day {
-  final int id;
-  final String date;
-
-  const Day({required this.id, required this.date});
-
-  Map<String, Object?> toMap() {
-    return {'id': id, 'date': date};
-  }
-
-  @override
-  String toString() {
-    return 'Day{id: $id, date: $date}';
-  }
-}
-
-var database;
-
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+  // Keep working offline; Firestore caches reads/writes and syncs on reconnect.
+  FirebaseFirestore.instance.settings =
+      const Settings(persistenceEnabled: true);
   try {
     await dotenv.load(fileName: ".env");
   } catch (_) {
     // .env not present — summarization will surface a clear error at use time.
   }
-  database = openDatabase(
-    join(await getDatabasesPath(), 'todosdatabase.db'),
-    onCreate: (db, version) async {
-      await db.execute(
-        'CREATE TABLE days(id INTEGER PRIMARY KEY, date TEXT)',
-      );
-      await db.execute(
-        'CREATE TABLE todos(id INTEGER PRIMARY KEY, day_id INTEGER, is_completed INTEGER, description TEXT, tag_id INTEGER, recurring_id INTEGER)',
-      );
-      await db.execute(
-        'CREATE TABLE tags(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, color INTEGER, position INTEGER)',
-      );
-      await db.execute(
-        'CREATE TABLE recurring(id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT, tag_id INTEGER, freq TEXT, start_day_id INTEGER, end_day_id INTEGER)',
-      );
-      await db.execute(
-        'CREATE TABLE recurring_skips(recurring_id INTEGER, day_id INTEGER)',
-      );
-    },
-    onUpgrade: (db, oldVersion, newVersion) async {
-      // v1 -> v2: introduce objective tags. Additive only — existing todos
-      // keep all their data and simply gain a NULL (untagged) tag_id.
-      if (oldVersion < 2) {
-        await db.execute('ALTER TABLE todos ADD COLUMN tag_id INTEGER');
-        await db.execute(
-          'CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, color INTEGER, position INTEGER)',
-        );
-      }
-      // v2 -> v3: introduce recurring tasks. Additive — existing todos gain a
-      // NULL recurring_id, plus two new tables for rules and per-day skips.
-      if (oldVersion < 3) {
-        await db.execute('ALTER TABLE todos ADD COLUMN recurring_id INTEGER');
-        await db.execute(
-          'CREATE TABLE IF NOT EXISTS recurring(id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT, tag_id INTEGER, freq TEXT, start_day_id INTEGER, end_day_id INTEGER)',
-        );
-        await db.execute(
-          'CREATE TABLE IF NOT EXISTS recurring_skips(recurring_id INTEGER, day_id INTEGER)',
-        );
-      }
-    },
-    version: 3,
-  );
 
   runApp(const DailyTodoApp());
 }
 
-Future<void> insertDay(Day day) async {
-  final db = await database;
-  await db.insert(
-    'days',
-    day.toMap(),
-    conflictAlgorithm: ConflictAlgorithm.replace,
-  );
+// ---- Firestore data layer (all scoped to the signed-in user) ------------
+
+CollectionReference<Map<String, dynamic>> _col(String name) {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance
+      .collection('users')
+      .doc(uid)
+      .collection(name);
 }
 
-Future<void> insertTodoItem(TodoItem todoItem) async {
-  final db = await database;
-  await db.insert(
-    'todos',
-    todoItem.toMap(),
-    conflictAlgorithm: ConflictAlgorithm.replace,
-  );
+CollectionReference<Map<String, dynamic>> get _todosCol => _col('todos');
+CollectionReference<Map<String, dynamic>> get _tagsCol => _col('tags');
+CollectionReference<Map<String, dynamic>> get _recurringCol =>
+    _col('recurring');
+CollectionReference<Map<String, dynamic>> get _skipsCol =>
+    _col('recurring_skips');
+
+List<TodoItem> _sortByOrder(Iterable<TodoItem> items) {
+  final list = items.toList();
+  list.sort((a, b) => a.order.compareTo(b.order));
+  return list;
 }
 
+// Creates a todo and returns its new document id.
+Future<String> insertTodoItem(TodoItem todoItem) async {
+  final ref = await _todosCol.add(todoItem.toMap());
+  return ref.id;
+}
+
+// Updates the mutable fields of a todo, leaving 'order' untouched.
 Future<void> updateTodoItem(TodoItem todoItem) async {
-  final db = await database;
-  await db.update(
-    'todos',
-    todoItem.toMap(),
-    where: 'id = ?',
-    whereArgs: [todoItem.id],
-  );
-}
-
-Future<List<Day>> days() async {
-  final db = await database;
-  final List<Map<String, Object?>> dayMaps = await db.query('days');
-  return [
-    for (final {'id': id as int, 'date': date as String} in dayMaps)
-      Day(id: id, date: date),
-  ];
-}
-
-Future<List<TodoItem>> todoItems() async {
-  final db = await database;
-  final List<Map<String, Object?>> todoMaps = await db.query('todos');
-  return [
-    for (final {
-      'id': id as int,
-      'day_id': dayId as int,
-      'is_completed': isCompleted as int,
-      'description': description as String,
-      'tag_id': tagId as int?,
-      'recurring_id': recurringId as int?
-    } in todoMaps)
-      TodoItem(
-        id: id,
-        dateId: dayId,
-        status: TodoStatus.fromCode(isCompleted),
-        description: description,
-        tagId: tagId,
-        recurringId: recurringId,
-      ),
-  ];
-}
-
-Future<List<TodoItem>> todoItemsForDay(int dayId) async {
-  final db = await database;
-  final List<Map<String, Object?>> todoMaps = await db.query(
-    'todos',
-    where: 'day_id = ?',
-    whereArgs: [dayId],
-  );
-  return [
-    for (final {
-      'id': id as int,
-      'day_id': dayId as int,
-      'is_completed': isCompleted as int,
-      'description': description as String,
-      'tag_id': tagId as int?,
-      'recurring_id': recurringId as int?
-    } in todoMaps)
-      TodoItem(
-        id: id,
-        dateId: dayId,
-        status: TodoStatus.fromCode(isCompleted),
-        description: description,
-        tagId: tagId,
-        recurringId: recurringId,
-      ),
-  ];
-}
-
-Future<List<TodoItem>> todoItemsForDayRange(int startDayId, int endDayId) async {
-  final db = await database;
-  final List<Map<String, Object?>> todoMaps = await db.query(
-    'todos',
-    where: 'day_id >= ? AND day_id <= ?',
-    whereArgs: [startDayId, endDayId],
-    orderBy: 'day_id ASC, id ASC',
-  );
-  return [
-    for (final {
-      'id': id as int,
-      'day_id': dayId as int,
-      'is_completed': isCompleted as int,
-      'description': description as String,
-      'tag_id': tagId as int?,
-      'recurring_id': recurringId as int?
-    } in todoMaps)
-      TodoItem(
-        id: id,
-        dateId: dayId,
-        status: TodoStatus.fromCode(isCompleted),
-        description: description,
-        tagId: tagId,
-        recurringId: recurringId,
-      ),
-  ];
-}
-
-Future<void> deleteTodoItem(int todoId) async {
-  final db = await database;
-  await db.delete(
-    'todos',
-    where: 'id = ?',
-    whereArgs: [todoId],
-  );
-}
-
-Future<List<Tag>> tagsAll() async {
-  final db = await database;
-  final List<Map<String, Object?>> tagMaps = await db.query(
-    'tags',
-    orderBy: 'position ASC, id ASC',
-  );
-  return [
-    for (final {
-      'id': id as int,
-      'name': name as String,
-      'color': color as int,
-      'position': position as int
-    } in tagMaps)
-      Tag(id: id, name: name, colorValue: color, position: position),
-  ];
-}
-
-Future<int> insertTag(String name, int colorValue, int position) async {
-  final db = await database;
-  return await db.insert(
-    'tags',
-    {'name': name, 'color': colorValue, 'position': position},
-  );
-}
-
-Future<void> updateTagRow(Tag tag) async {
-  final db = await database;
-  await db.update(
-    'tags',
-    tag.toMap(),
-    where: 'id = ?',
-    whereArgs: [tag.id],
-  );
-}
-
-Future<void> deleteTagRow(int tagId) async {
-  final db = await database;
-  // Unlink any todos using this tag (they become untagged), then drop the tag.
-  await db.update(
-    'todos',
-    {'tag_id': null},
-    where: 'tag_id = ?',
-    whereArgs: [tagId],
-  );
-  await db.delete('tags', where: 'id = ?', whereArgs: [tagId]);
-}
-
-// Persists only the tag_id of a single todo without touching other fields.
-Future<void> updateTodoTag(int todoId, int? tagId) async {
-  final db = await database;
-  await db.update(
-    'todos',
-    {'tag_id': tagId},
-    where: 'id = ?',
-    whereArgs: [todoId],
-  );
-}
-
-// Reassigns a todo to a different day (used by rollover — a true move).
-Future<void> moveTodoToDay(int todoId, int newDayId) async {
-  final db = await database;
-  await db.update(
-    'todos',
-    {'day_id': newDayId},
-    where: 'id = ?',
-    whereArgs: [todoId],
-  );
-}
-
-Future<List<RecurringRule>> recurringAll() async {
-  final db = await database;
-  final List<Map<String, Object?>> maps =
-      await db.query('recurring', orderBy: 'id ASC');
-  return [
-    for (final {
-      'id': id as int,
-      'description': description as String,
-      'tag_id': tagId as int?,
-      'freq': freq as String,
-      'start_day_id': startDayId as int,
-      'end_day_id': endDayId as int?
-    } in maps)
-      RecurringRule(
-        id: id,
-        description: description,
-        tagId: tagId,
-        freq: RecurFreq.fromCode(freq),
-        startDayId: startDayId,
-        endDayId: endDayId,
-      ),
-  ];
-}
-
-Future<int> insertRecurring(RecurringRule rule) async {
-  final db = await database;
-  return await db.insert('recurring', {
-    'description': rule.description,
-    'tag_id': rule.tagId,
-    'freq': rule.freq.toCode(),
-    'start_day_id': rule.startDayId,
-    'end_day_id': rule.endDayId,
+  await _todosCol.doc(todoItem.id).update({
+    'day_id': todoItem.dateId,
+    'is_completed': todoItem.status.toCode(),
+    'description': todoItem.description,
+    'tag_id': todoItem.tagId,
+    'recurring_id': todoItem.recurringId,
   });
 }
 
+Future<List<TodoItem>> todoItems() async {
+  final snap = await _todosCol.get();
+  return _sortByOrder(snap.docs.map(TodoItem.fromDoc));
+}
+
+Future<List<TodoItem>> todoItemsForDay(int dayId) async {
+  final snap = await _todosCol.where('day_id', isEqualTo: dayId).get();
+  return _sortByOrder(snap.docs.map(TodoItem.fromDoc));
+}
+
+Future<List<TodoItem>> todoItemsForDayRange(int startDayId, int endDayId) async {
+  final snap = await _todosCol
+      .where('day_id', isGreaterThanOrEqualTo: startDayId)
+      .where('day_id', isLessThanOrEqualTo: endDayId)
+      .get();
+  final list = snap.docs.map(TodoItem.fromDoc).toList();
+  list.sort((a, b) {
+    final byDay = a.dateId.compareTo(b.dateId);
+    return byDay != 0 ? byDay : a.order.compareTo(b.order);
+  });
+  return list;
+}
+
+Future<void> deleteTodoItem(String todoId) async {
+  await _todosCol.doc(todoId).delete();
+}
+
+Future<List<Tag>> tagsAll() async {
+  final snap = await _tagsCol.get();
+  final list = snap.docs.map(Tag.fromDoc).toList();
+  list.sort((a, b) => a.position.compareTo(b.position));
+  return list;
+}
+
+Future<String> insertTag(String name, int colorValue, int position) async {
+  final ref = await _tagsCol
+      .add({'name': name, 'color': colorValue, 'position': position});
+  return ref.id;
+}
+
+Future<void> updateTagRow(Tag tag) async {
+  await _tagsCol.doc(tag.id).set(tag.toMap());
+}
+
+Future<void> deleteTagRow(String tagId) async {
+  // Unlink any todos using this tag (they become untagged), then drop the tag.
+  final tagged = await _todosCol.where('tag_id', isEqualTo: tagId).get();
+  final batch = FirebaseFirestore.instance.batch();
+  for (final doc in tagged.docs) {
+    batch.update(doc.reference, {'tag_id': null});
+  }
+  batch.delete(_tagsCol.doc(tagId));
+  await batch.commit();
+}
+
+// Persists only the tag_id of a single todo without touching other fields.
+Future<void> updateTodoTag(String todoId, String? tagId) async {
+  await _todosCol.doc(todoId).update({'tag_id': tagId});
+}
+
+// Reassigns a todo to a different day (used by rollover — a true move).
+Future<void> moveTodoToDay(String todoId, int newDayId) async {
+  await _todosCol.doc(todoId).update({'day_id': newDayId});
+}
+
+Future<List<RecurringRule>> recurringAll() async {
+  final snap = await _recurringCol.get();
+  return snap.docs.map(RecurringRule.fromDoc).toList();
+}
+
+Future<String> insertRecurring(RecurringRule rule) async {
+  final ref = await _recurringCol.add(rule.toMap());
+  return ref.id;
+}
+
 Future<void> updateRecurring(RecurringRule rule) async {
-  final db = await database;
-  await db.update(
-    'recurring',
-    rule.toMap(),
-    where: 'id = ?',
-    whereArgs: [rule.id],
-  );
+  await _recurringCol.doc(rule.id).set(rule.toMap());
 }
 
-Future<void> deleteRecurring(int ruleId) async {
-  final db = await database;
-  await db.delete('recurring', where: 'id = ?', whereArgs: [ruleId]);
-  await db
-      .delete('recurring_skips', where: 'recurring_id = ?', whereArgs: [ruleId]);
+Future<void> deleteRecurring(String ruleId) async {
+  await _recurringCol.doc(ruleId).delete();
+  final skips = await _skipsCol.where('recurring_id', isEqualTo: ruleId).get();
+  for (final doc in skips.docs) {
+    await doc.reference.delete();
+  }
 }
 
-Future<Set<int>> recurringSkipsForDay(int dayId) async {
-  final db = await database;
-  final maps = await db
-      .query('recurring_skips', where: 'day_id = ?', whereArgs: [dayId]);
-  return {for (final m in maps) m['recurring_id'] as int};
+Future<Set<String>> recurringSkipsForDay(int dayId) async {
+  final snap = await _skipsCol.where('day_id', isEqualTo: dayId).get();
+  return {for (final d in snap.docs) d.data()['recurring_id'] as String};
 }
 
-Future<void> addRecurringSkip(int recurringId, int dayId) async {
-  final db = await database;
-  await db.insert(
-      'recurring_skips', {'recurring_id': recurringId, 'day_id': dayId});
+Future<void> addRecurringSkip(String recurringId, int dayId) async {
+  await _skipsCol.add({'recurring_id': recurringId, 'day_id': dayId});
 }
 
 class DailyTodoApp extends StatelessWidget {
@@ -589,9 +445,7 @@ class DailyTodoPage extends StatefulWidget {
 class _DailyTodoPageState extends State<DailyTodoPage> {
   DateTime currentDate = DateTime.now();
   final Map<String, List<Todo>> todosByDate = {};
-  final Map<String, List<int>> todoIdsByDate = {}; // Track todo IDs for deletion
   final TextEditingController todoController = TextEditingController();
-  final Map<int, int> _todoCountersByDay = {};
 
   // Objective tags (persisted) and how breakdowns are displayed.
   List<Tag> _tags = [];
@@ -602,7 +456,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 
   // Rollover: ids of yesterday's incomplete todos eligible to move to today,
   // and the set of today-ids we've already prompted for this session.
-  List<int> _rolloverTodoIds = [];
+  List<String> _rolloverTodoIds = [];
   final Set<int> _rolloverHandled = {};
 
   @override
@@ -637,7 +491,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
       DateTime(ZERO_DATE.year, ZERO_DATE.month, ZERO_DATE.day)
           .add(Duration(days: dayId));
 
-  Tag? tagById(int? id) {
+  Tag? tagById(String? id) {
     if (id == null) return null;
     for (final t in _tags) {
       if (t.id == id) return t;
@@ -651,49 +505,37 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 
     List<TodoItem> dbTodos = await todoItemsForDay(dayId);
 
-    // Counter base for any new ids we mint on this day.
-    int counter = 0;
-    if (dbTodos.isNotEmpty) {
-      counter =
-          dbTodos.map((t) => t.id % 10000).reduce((a, b) => a > b ? a : b) + 1;
-    }
-
     // Materialize any due recurring instances not already present (or skipped).
-    final generated = await _generateRecurringForDay(dayId, dbTodos, counter);
+    final generated = await _generateRecurringForDay(dayId, dbTodos);
     if (generated.isNotEmpty) {
       dbTodos = [...dbTodos, ...generated];
-      counter += generated.length;
     }
 
     if (!mounted) return;
     setState(() {
-      final key = dateKey;
-      todosByDate[key] = dbTodos
+      todosByDate[dateKey] = dbTodos
           .map((todoItem) => Todo(
+                id: todoItem.id,
                 text: todoItem.description,
                 status: todoItem.status,
                 tagId: todoItem.tagId,
                 recurringId: todoItem.recurringId,
+                order: todoItem.order,
               ))
           .toList();
-
-      todoIdsByDate[key] = dbTodos.map((todoItem) => todoItem.id).toList();
-      _todoCountersByDay[dayId] = counter;
     });
 
     await _checkRollover();
   }
 
   // Inserts and returns recurring-task instances that are due on [dayId] but
-  // not yet present in [existing] and not skipped. [startCounter] seeds new ids.
+  // not yet present in [existing] and not skipped.
   Future<List<TodoItem>> _generateRecurringForDay(
-      int dayId, List<TodoItem> existing, int startCounter) async {
+      int dayId, List<TodoItem> existing) async {
     if (_recurringRules.isEmpty) return const [];
 
-    final presentRuleIds = existing
-        .map((t) => t.recurringId)
-        .whereType<int>()
-        .toSet();
+    final presentRuleIds =
+        existing.map((t) => t.recurringId).whereType<String>().toSet();
 
     final due = _recurringRules.where((r) {
       if (presentRuleIds.contains(r.id)) return false;
@@ -705,20 +547,27 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 
     final skips = await recurringSkipsForDay(dayId);
     final List<TodoItem> created = [];
-    int counter = startCounter;
     for (final rule in due) {
       if (skips.contains(rule.id)) continue;
-      final item = TodoItem(
-        id: (dayId * 10000) + counter,
+      final order = DateTime.now().microsecondsSinceEpoch;
+      final id = await insertTodoItem(TodoItem(
+        id: '',
         dateId: dayId,
         status: TodoStatus.notStarted,
         description: rule.description,
         tagId: rule.tagId,
         recurringId: rule.id,
-      );
-      counter++;
-      await insertTodoItem(item);
-      created.add(item);
+        order: order,
+      ));
+      created.add(TodoItem(
+        id: id,
+        dateId: dayId,
+        status: TodoStatus.notStarted,
+        description: rule.description,
+        tagId: rule.tagId,
+        recurringId: rule.id,
+        order: order,
+      ));
     }
     return created;
   }
@@ -738,64 +587,56 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   List<Todo> getTodosForCurrentDate() =>
       todosByDate[getDateKey(currentDate)] ?? [];
 
-  void addTodo() {
+  void addTodo() async {
     final text = todoController.text.trim();
     if (text.isEmpty) return;
 
+    final key = getDateKey(currentDate);
+    final dayId = getDayId(currentDate);
+    final order = DateTime.now().microsecondsSinceEpoch;
+    final todo = Todo(text: text, order: order);
+
     setState(() {
-      final key = getDateKey(currentDate);
       todosByDate.putIfAbsent(key, () => []);
-      todosByDate[key]!.add(Todo(text: text));
-      
-      // Initialize ID list for this date if needed
-      todoIdsByDate.putIfAbsent(key, () => []);
-      // Temporarily add -1, will be assigned real ID when pushed to DB
-      todoIdsByDate[key]!.add(-1);
-      
+      todosByDate[key]!.add(todo);
       todoController.clear();
     });
+
+    // Persist immediately and remember the Firestore id for later edits.
+    final id = await insertTodoItem(TodoItem(
+      id: '',
+      dateId: dayId,
+      status: TodoStatus.notStarted,
+      description: text,
+      order: order,
+    ));
+    todo.id = id;
   }
 
   void setTodoStatus(int index, TodoStatus newStatus) async {
-    setState(() {
-      final key = getDateKey(currentDate);
-      todosByDate[key]![index].status = newStatus;
-    });
-
     final key = getDateKey(currentDate);
-    if (todoIdsByDate.containsKey(key) &&
-        index < todoIdsByDate[key]!.length &&
-        todoIdsByDate[key]![index] != -1) {
-      int todoId = todoIdsByDate[key]![index];
-      int dayId = getDayId(currentDate);
-      final todo = todosByDate[key]![index];
+    final todo = todosByDate[key]![index];
+    setState(() => todo.status = newStatus);
 
-      TodoItem todoItem = TodoItem(
-        id: todoId,
-        dateId: dayId,
+    if (todo.id != null) {
+      await updateTodoItem(TodoItem(
+        id: todo.id!,
+        dateId: getDayId(currentDate),
         status: todo.status,
         description: todo.text,
         tagId: todo.tagId,
         recurringId: todo.recurringId,
-      );
-
-      await updateTodoItem(todoItem);
-      print('Updated todo $todoId status: ${todo.status}');
+      ));
     }
   }
 
-  void setTodoTag(int index, int? tagId) async {
-    setState(() {
-      final key = getDateKey(currentDate);
-      todosByDate[key]![index].tagId = tagId;
-    });
-
+  void setTodoTag(int index, String? tagId) async {
     final key = getDateKey(currentDate);
-    if (todoIdsByDate.containsKey(key) &&
-        index < todoIdsByDate[key]!.length &&
-        todoIdsByDate[key]![index] != -1) {
-      final todoId = todoIdsByDate[key]![index];
-      await updateTodoTag(todoId, tagId);
+    final todo = todosByDate[key]![index];
+    setState(() => todo.tagId = tagId);
+
+    if (todo.id != null) {
+      await updateTodoTag(todo.id!, tagId);
     }
   }
 
@@ -804,82 +645,21 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     final todo = todosByDate[key]![index];
     final dayId = getDayId(currentDate);
 
-    // Get the todo ID if it exists
-    if (todoIdsByDate.containsKey(key) &&
-        index < todoIdsByDate[key]!.length &&
-        todoIdsByDate[key]![index] != -1) {
-      int todoId = todoIdsByDate[key]![index];
-      await deleteTodoItem(todoId);
-      print('Deleted todo with ID: $todoId');
-    }
+    setState(() => todosByDate[key]!.removeAt(index));
 
+    if (todo.id != null) {
+      await deleteTodoItem(todo.id!);
+    }
     // If this was a recurring instance, remember the skip so it doesn't
     // regenerate the next time this day is opened.
     if (todo.recurringId != null) {
       await addRecurringSkip(todo.recurringId!, dayId);
     }
-
-    setState(() {
-      todosByDate[key]!.removeAt(index);
-      if (todoIdsByDate.containsKey(key) && index < todoIdsByDate[key]!.length) {
-        todoIdsByDate[key]!.removeAt(index);
-      }
-    });
   }
 
-  Future<void> pushDayAndTodos() async {
-    int dayId = getDayId(currentDate);
-    Day toPush = Day(id: dayId, date: getDateKey(currentDate));
-
-    await insertDay(toPush);
-
-    // Push all todos for current day
-    final key = getDateKey(currentDate);
-    final todos = todosByDate[key] ?? [];
-    
-    // Initialize counter for this day if not exists
-    if (!_todoCountersByDay.containsKey(dayId)) {
-      _todoCountersByDay[dayId] = 0;
-    }
-    
-    // Initialize ID list for this date if needed
-    todoIdsByDate.putIfAbsent(key, () => []);
-    
-    for (int i = 0; i < todos.length; i++) {
-      final todo = todos[i];
-      
-      // Skip if this todo already has a valid ID (already in database)
-      if (i < todoIdsByDate[key]!.length && todoIdsByDate[key]![i] != -1) {
-        continue;
-      }
-      
-      // Create unique ID: dayId * 10000 + counter
-      // This allows up to 10,000 todos per day without collisions
-      int todoId = (dayId * 10000) + _todoCountersByDay[dayId]!;
-      _todoCountersByDay[dayId] = _todoCountersByDay[dayId]! + 1;
-      
-      // Store the ID so we can delete it later
-      if (i < todoIdsByDate[key]!.length) {
-        todoIdsByDate[key]![i] = todoId;
-      } else {
-        todoIdsByDate[key]!.add(todoId);
-      }
-      
-      TodoItem todoItem = TodoItem(
-        id: todoId,
-        dateId: dayId,
-        status: todo.status,
-        description: todo.text,
-        tagId: todo.tagId,
-        recurringId: todo.recurringId,
-      );
-      await insertTodoItem(todoItem);
-    }
-
-    // Print database contents for debugging
-    print('Days: ${await days()}');
-    print('Todos: ${await todoItems()}');
-  }
+  // Todos are now written to Firestore as they change, so there is nothing to
+  // flush before navigating. Kept as a no-op so existing call sites still work.
+  Future<void> pushDayAndTodos() async {}
 
   void goToPreviousDay() async {
     await pushDayAndTodos();
@@ -949,11 +729,11 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   // ---- Recurring rules ----------------------------------------------------
 
   Future<void> addRecurring(
-      String description, RecurFreq freq, int? tagId, int? endDayId) async {
+      String description, RecurFreq freq, String? tagId, int? endDayId) async {
     final trimmed = description.trim();
     if (trimmed.isEmpty) return;
     await insertRecurring(RecurringRule(
-      id: 0,
+      id: '',
       description: trimmed,
       tagId: tagId,
       freq: freq,
@@ -1043,8 +823,8 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 
   // Aggregates (tagId, status) pairs into per-tag totals (null => Untagged).
   List<TagStat> computeTagStats(
-      Iterable<({int? tagId, TodoStatus status})> items) {
-    final byTag = <int?, TagStat>{};
+      Iterable<({String? tagId, TodoStatus status})> items) {
+    final byTag = <String?, TagStat>{};
     for (final item in items) {
       final stat = byTag.putIfAbsent(item.tagId, () {
         final tag = tagById(item.tagId);
@@ -1859,11 +1639,6 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
           final key = getDateKey(currentDate);
           final todo = todosByDate[key]!.removeAt(oldIndex);
           todosByDate[key]!.insert(newIndex, todo);
-
-          if (todoIdsByDate.containsKey(key)) {
-            final todoId = todoIdsByDate[key]!.removeAt(oldIndex);
-            todoIdsByDate[key]!.insert(newIndex, todoId);
-          }
         });
       },
       itemBuilder: (context, index) {
@@ -1890,16 +1665,20 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 }
 
 class Todo {
+  String? id; // Firestore document id (null until first persisted)
   String text;
   TodoStatus status;
-  int? tagId;
-  int? recurringId;
+  String? tagId;
+  String? recurringId;
+  int order;
 
   Todo({
+    this.id,
     required this.text,
     this.status = TodoStatus.notStarted,
     this.tagId,
     this.recurringId,
+    this.order = 0,
   });
 }
 
@@ -2059,7 +1838,7 @@ class _TodoCard extends StatelessWidget {
   final List<Tag> tags;
   final Tag? selectedTag;
   final ValueChanged<TodoStatus> onStatusChange;
-  final ValueChanged<int?> onTagChange;
+  final ValueChanged<String?> onTagChange;
   final VoidCallback onDelete;
 
   const _TodoCard({
@@ -2340,7 +2119,7 @@ class _TagStatChip extends StatelessWidget {
 class _TagPicker extends StatelessWidget {
   final List<Tag> tags;
   final Tag? selected;
-  final ValueChanged<int?> onChanged;
+  final ValueChanged<String?> onChanged;
 
   const _TagPicker({
     required this.tags,
@@ -2350,15 +2129,15 @@ class _TagPicker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return PopupMenuButton<int>(
+    return PopupMenuButton<String>(
       tooltip: 'Assign objective',
       offset: const Offset(0, 36),
       shape:
           RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      onSelected: (v) => onChanged(v == -1 ? null : v),
+      onSelected: (v) => onChanged(v == '__none__' ? null : v),
       itemBuilder: (context) => [
         ...tags.map(
-          (t) => PopupMenuItem<int>(
+          (t) => PopupMenuItem<String>(
             value: t.id,
             child: Row(
               children: [
@@ -2385,8 +2164,8 @@ class _TagPicker extends StatelessWidget {
           ),
         ),
         if (tags.isNotEmpty) const PopupMenuDivider(),
-        const PopupMenuItem<int>(
-          value: -1,
+        const PopupMenuItem<String>(
+          value: '__none__',
           child: Text(
             'No objective',
             style: TextStyle(
@@ -2924,10 +2703,10 @@ Future<String?> _promptText(
 class _RecurringManagerDialog extends StatefulWidget {
   final List<RecurringRule> Function() getRules;
   final List<Tag> tags;
-  final Tag? Function(int?) tagById;
+  final Tag? Function(String?) tagById;
   final int Function(DateTime) dayIdFromDate;
   final DateTime Function(int) dateFromDayId;
-  final Future<void> Function(String, RecurFreq, int?, int?) onAdd;
+  final Future<void> Function(String, RecurFreq, String?, int?) onAdd;
   final Future<void> Function(RecurringRule) onUpdate;
   final Future<void> Function(RecurringRule) onDelete;
 
@@ -2950,7 +2729,7 @@ class _RecurringManagerDialog extends StatefulWidget {
 class _RecurringManagerDialogState extends State<_RecurringManagerDialog> {
   final TextEditingController _descController = TextEditingController();
   RecurFreq _freq = RecurFreq.daily;
-  int? _tagId;
+  String? _tagId;
   DateTime? _endDate;
 
   @override
@@ -3335,7 +3114,7 @@ class _RecurringManagerDialogState extends State<_RecurringManagerDialog> {
     );
   }
 
-  Widget _tagChoice(int? id, String label, Color? color) {
+  Widget _tagChoice(String? id, String label, Color? color) {
     final active = _tagId == id;
     return GestureDetector(
       onTap: () => setState(() => _tagId = id),
