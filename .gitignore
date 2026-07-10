@@ -1,6 +1,9 @@
 # Secrets / environment
 .env
 
+# One-time legacy data import (personal data; bundled at build, not committed)
+assets/legacy_import.json
+
 # Miscellaneous
 *.class
 *.log

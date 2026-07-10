@@ -10,6 +10,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'firebase_options.dart';
 import 'auth_gate.dart';
+import 'migrate.dart';
 
 final DateTime ZERO_DATE = DateTime.utc(2026, 1, 24);
 
@@ -472,6 +473,9 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   }
 
   Future<void> _init() async {
+    // One-time import of legacy on-device data into the cloud (no-op after
+    // the first successful run per account).
+    await migrateLegacyDataIfNeeded();
     await loadTags();
     await loadRecurring();
     await loadTodosForCurrentDate();

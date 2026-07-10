@@ -41,5 +41,6 @@ flutter:
             weight: 700
   assets:
       - .env
+      - assets/legacy_import.json
   uses-material-design: true
 
