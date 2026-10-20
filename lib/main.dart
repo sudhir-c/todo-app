@@ -3,13 +3,13 @@ import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'firebase_options.dart';
 import 'auth_gate.dart';
+import 'gcal.dart';
 import 'migrate.dart';
 
 final DateTime ZERO_DATE = DateTime.utc(2026, 1, 24);
@@ -117,6 +117,7 @@ class TodoItem {
   final int dateId;
   final String? tagId;
   final String? recurringId;
+  final String? gcalEventId;
   final int order;
 
   const TodoItem({
@@ -126,6 +127,7 @@ class TodoItem {
     required this.dateId,
     this.tagId,
     this.recurringId,
+    this.gcalEventId,
     this.order = 0,
   });
 
@@ -137,6 +139,7 @@ class TodoItem {
       'day_id': dateId,
       'tag_id': tagId,
       'recurring_id': recurringId,
+      'gcal_event_id': gcalEventId,
       'order': order,
     };
   }
@@ -150,6 +153,7 @@ class TodoItem {
       description: d['description'] as String? ?? '',
       tagId: d['tag_id'] as String?,
       recurringId: d['recurring_id'] as String?,
+      gcalEventId: d['gcal_event_id'] as String?,
       order: (d['order'] as num?)?.toInt() ?? 0,
     );
   }
@@ -206,11 +210,16 @@ class Tag {
   final int colorValue;
   final int position;
 
+  // Retired objectives: no longer offered for new todos, but their existing
+  // todos keep the link and still count in breakdowns.
+  final bool archived;
+
   const Tag({
     required this.id,
     required this.name,
     required this.colorValue,
     required this.position,
+    this.archived = false,
   });
 
   Color get color => Color(colorValue);
@@ -220,6 +229,7 @@ class Tag {
       'name': name,
       'color': colorValue,
       'position': position,
+      'archived': archived,
     };
   }
 
@@ -230,11 +240,13 @@ class Tag {
       name: d['name'] as String? ?? '',
       colorValue: (d['color'] as num?)?.toInt() ?? 0xFF8A94A6,
       position: (d['position'] as num?)?.toInt() ?? 0,
+      archived: d['archived'] as bool? ?? false,
     );
   }
 
   @override
-  String toString() => 'Tag{id: $id, name: $name, position: $position}';
+  String toString() =>
+      'Tag{id: $id, name: $name, position: $position, archived: $archived}';
 }
 
 // Aggregated counts for one tag (or the Untagged bucket) within a scope.
@@ -262,12 +274,6 @@ void main() async {
   // Keep working offline; Firestore caches reads/writes and syncs on reconnect.
   FirebaseFirestore.instance.settings =
       const Settings(persistenceEnabled: true);
-  try {
-    await dotenv.load(fileName: ".env");
-  } catch (_) {
-    // .env not present — summarization will surface a clear error at use time.
-  }
-
   runApp(const DailyTodoApp());
 }
 
@@ -287,6 +293,8 @@ CollectionReference<Map<String, dynamic>> get _recurringCol =>
     _col('recurring');
 CollectionReference<Map<String, dynamic>> get _skipsCol =>
     _col('recurring_skips');
+CollectionReference<Map<String, dynamic>> get _gcalSkipsCol =>
+    _col('gcal_skips');
 
 List<TodoItem> _sortByOrder(Iterable<TodoItem> items) {
   final list = items.toList();
@@ -355,6 +363,11 @@ Future<void> updateTagRow(Tag tag) async {
   await _tagsCol.doc(tag.id).set(tag.toMap());
 }
 
+// Archives/unarchives a tag without touching its other fields.
+Future<void> setTagArchived(String tagId, bool archived) async {
+  await _tagsCol.doc(tagId).update({'archived': archived});
+}
+
 Future<void> deleteTagRow(String tagId) async {
   // Unlink any todos using this tag (they become untagged), then drop the tag.
   final tagged = await _todosCol.where('tag_id', isEqualTo: tagId).get();
@@ -405,6 +418,26 @@ Future<Set<String>> recurringSkipsForDay(int dayId) async {
 
 Future<void> addRecurringSkip(String recurringId, int dayId) async {
   await _skipsCol.add({'recurring_id': recurringId, 'day_id': dayId});
+}
+
+// Calendar-event skips: event instances the user deleted for a given day.
+Future<Set<String>> gcalSkipsForDay(int dayId) async {
+  final snap = await _gcalSkipsCol.where('day_id', isEqualTo: dayId).get();
+  return {for (final d in snap.docs) d.data()['event_id'] as String};
+}
+
+Future<void> addGcalSkip(String eventId, int dayId) async {
+  await _gcalSkipsCol.add({'event_id': eventId, 'day_id': dayId});
+}
+
+// Per-user Google Calendar settings (users/{uid}/meta/gcal).
+Future<Map<String, dynamic>> gcalMeta() async {
+  final snap = await _col('meta').doc('gcal').get();
+  return snap.data() ?? const {};
+}
+
+Future<void> updateGcalMeta(Map<String, Object?> fields) async {
+  await _col('meta').doc('gcal').set(fields, SetOptions(merge: true));
 }
 
 class DailyTodoApp extends StatelessWidget {
@@ -458,6 +491,12 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
   // Recurring task rules (persisted).
   List<RecurringRule> _recurringRules = [];
 
+  // Google Calendar sync. The enabled flag and tag id live in meta/gcal;
+  // the Google session itself is per-device (google_sign_in keychain).
+  bool _gcalEnabled = false;
+  String? _gcalTagId;
+  bool _gcalNeedsReconnect = false;
+
   // Rollover: ids of yesterday's incomplete todos eligible to move to today,
   // and the set of today-ids we've already prompted for this session.
   List<String> _rolloverTodoIds = [];
@@ -478,6 +517,9 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     await migrateLegacyDataIfNeeded();
     await loadTags();
     await loadRecurring();
+    final gcal = await gcalMeta();
+    _gcalEnabled = gcal['enabled'] == true;
+    _gcalTagId = gcal['tag_id'] as String?;
     await loadTodosForCurrentDate();
   }
 
@@ -493,10 +535,22 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     setState(() => _recurringRules = loaded);
   }
 
-  // The calendar date represented by a day id (inverse of getDayId).
-  DateTime dateFromDayId(int dayId) =>
-      DateTime(ZERO_DATE.year, ZERO_DATE.month, ZERO_DATE.day)
-          .add(Duration(days: dayId));
+  // The calendar date represented by a day id — the exact inverse of
+  // getDayId. Naively adding 24h days drifts across DST changes (getDayId
+  // truncates a local-midnight diff, which loses an hour each spring), so
+  // start from the naive guess and nudge until getDayId round-trips.
+  DateTime dateFromDayId(int dayId) {
+    var d = DateTime(ZERO_DATE.year, ZERO_DATE.month, ZERO_DATE.day)
+        .add(Duration(days: dayId));
+    d = DateTime(d.year, d.month, d.day);
+    while (getDayId(d) < dayId) {
+      d = DateTime(d.year, d.month, d.day + 1);
+    }
+    while (getDayId(d) > dayId) {
+      d = DateTime(d.year, d.month, d.day - 1);
+    }
+    return d;
+  }
 
   Tag? tagById(String? id) {
     if (id == null) return null;
@@ -506,6 +560,10 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     return null;
   }
 
+  // The tags offered as a choice for new work. Archived ones stay in `_tags`
+  // so tagById can still resolve names/colors for todos that already use them.
+  List<Tag> get _activeTags => _tags.where((t) => !t.archived).toList();
+
   Future<void> loadTodosForCurrentDate() async {
     final dayId = getDayId(currentDate);
 
@@ -513,6 +571,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     // based on a one-time read; the live listener then reflects them.
     final existing = await todoItemsForDay(dayId);
     await _generateRecurringForDay(dayId, existing);
+    await _syncCalendarForDay(dayId, existing);
 
     // Drive the list from a live listener so edits from another device (or
     // this one) appear automatically — no manual refresh needed.
@@ -541,6 +600,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
                   status: t.status,
                   tagId: t.tagId,
                   recurringId: t.recurringId,
+                  gcalEventId: t.gcalEventId,
                   order: t.order,
                 ))
             .toList();
@@ -590,6 +650,93 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
       ));
     }
     return created;
+  }
+
+  // Materializes the day's Google Calendar events as todos (deduped by
+  // gcal_event_id, honoring per-day skips). While a todo is still Not
+  // Started it follows its event: renames/moves update it, cancellations
+  // remove it. Started/completed todos are never touched.
+  Future<void> _syncCalendarForDay(int dayId, List<TodoItem> existing) async {
+    if (!_gcalEnabled) return;
+    // Browsing history must not retro-import past events as unfinished todos.
+    if (dayId < getDayId(DateTime.now())) return;
+
+    List<GcalEvent>? events;
+    try {
+      events = await fetchGcalEventsForDay(dateFromDayId(dayId));
+    } catch (e) {
+      debugPrint('[gcal] sync failed: $e');
+      return; // offline or API hiccup — the day still loads without sync
+    }
+    if (events == null) {
+      debugPrint('[gcal] sync: no token — reconnect needed');
+      // No silent Google session on this device; offer a reconnect.
+      if (!_gcalNeedsReconnect && mounted) {
+        setState(() => _gcalNeedsReconnect = true);
+      }
+      return;
+    }
+    if (_gcalNeedsReconnect && mounted) {
+      setState(() => _gcalNeedsReconnect = false);
+    }
+
+    final tagId = await _ensureCalendarTag();
+    final skips = await gcalSkipsForDay(dayId);
+    final byEventId = {
+      for (final t in existing)
+        if (t.gcalEventId != null) t.gcalEventId!: t,
+    };
+
+    for (final event in events) {
+      final text = event.allDay
+          ? event.title
+          : '${DateFormat('h:mm a').format(event.start!)} — ${event.title}';
+      final current = byEventId.remove(event.id);
+      if (current == null) {
+        if (skips.contains(event.id)) continue;
+        await insertTodoItem(TodoItem(
+          id: '',
+          dateId: dayId,
+          status: TodoStatus.notStarted,
+          description: text,
+          tagId: tagId,
+          gcalEventId: event.id,
+          order: event.start?.microsecondsSinceEpoch ??
+              DateTime.now().microsecondsSinceEpoch,
+        ));
+      } else if (current.status == TodoStatus.notStarted &&
+          current.description != text) {
+        await _todosCol.doc(current.id).update({'description': text});
+      }
+    }
+
+    // Whatever is left no longer exists on the calendar: drop instances the
+    // user hasn't started, keep the ones they've acted on.
+    for (final orphan in byEventId.values) {
+      if (orphan.status == TodoStatus.notStarted) {
+        await deleteTodoItem(orphan.id);
+      }
+    }
+  }
+
+  // Resolves (creating on first use) the "Calendar" objective for imports.
+  Future<String?> _ensureCalendarTag() async {
+    if (tagById(_gcalTagId) != null) return _gcalTagId;
+    String? id;
+    for (final t in _tags) {
+      if (t.name.toLowerCase() == 'calendar') {
+        id = t.id;
+        break;
+      }
+    }
+    if (id == null) {
+      final color = kTagPalette[_tags.length % kTagPalette.length].value;
+      id = await insertTag('Calendar', color, _tags.length);
+      await loadTags();
+    }
+    _gcalTagId = id;
+    await updateGcalMeta({'tag_id': id});
+    return id;
   }
 
   String getDateKey(DateTime date) => DateFormat('yyyy-MM-dd').format(date);
@@ -675,6 +822,10 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     if (todo.recurringId != null) {
       await addRecurringSkip(todo.recurringId!, dayId);
     }
+    // Same idea for calendar events: a deleted instance must not re-import.
+    if (todo.gcalEventId != null) {
+      await addGcalSkip(todo.gcalEventId!, dayId);
+    }
   }
 
   // Todos are now written to Firestore as they change, so there is nothing to
@@ -723,7 +874,9 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     final prev = await todoItemsForDay(todayId - 1);
     final candidates = prev
         .where((t) =>
-            t.status != TodoStatus.completed && t.recurringId == null)
+            t.status != TodoStatus.completed &&
+            t.recurringId == null &&
+            t.gcalEventId == null)
         .map((t) => t.id)
         .toList();
 
@@ -795,7 +948,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
           ),
           child: _RecurringManagerDialog(
             getRules: () => _recurringRules,
-            tags: _tags,
+            tags: _activeTags,
             tagById: tagById,
             dayIdFromDate: getDayId,
             dateFromDayId: dateFromDayId,
@@ -825,9 +978,23 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
       name: trimmed,
       colorValue: tag.colorValue,
       position: tag.position,
+      archived: tag.archived,
     ));
     await loadTags();
   }
+
+  Future<void> setArchived(Tag tag, bool archived) async {
+    await setTagArchived(tag.id, archived);
+    await loadTags();
+    if (mounted) setState(() {});
+  }
+
+  // Descriptions of the recurring rules still pinned to a tag (used to warn
+  // before archiving — the rules keep working either way).
+  List<String> recurringUsingTag(String tagId) => _recurringRules
+      .where((r) => r.tagId == tagId)
+      .map((r) => r.description)
+      .toList();
 
   Future<void> removeTag(Tag tag) async {
     await deleteTagRow(tag.id);
@@ -901,6 +1068,8 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
             onAddTag: addTag,
             onRenameTag: renameTag,
             onRemoveTag: removeTag,
+            onArchiveTag: setArchived,
+            recurringUsingTag: recurringUsingTag,
             fetchRangeStats: (days) async {
               final endDayId = getDayId(DateTime.now());
               final startDayId = endDayId - (days - 1);
@@ -957,7 +1126,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
               ),
               const SizedBox(height: 14),
               Text(
-                'Pick a window and I\'ll send your todos to an LLM and summarize what you accomplished.',
+                'Pick a window and I\'ll have Claude Code summarize what you accomplished.',
                 style: TextStyle(
                   fontFamily: 'Jost',
                   fontSize: 14,
@@ -1029,7 +1198,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
 
     String summary;
     try {
-      summary = await _callOpenAI(prompt);
+      summary = await _callClaude(prompt);
     } catch (e) {
       if (!mounted) return;
       Navigator.of(context, rootNavigator: true).pop();
@@ -1063,7 +1232,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     buffer.writeln();
 
     for (final dayId in sortedDayIds) {
-      final dayDate = ZERO_DATE.add(Duration(days: dayId));
+      final dayDate = dateFromDayId(dayId);
       final label = DateFormat('EEEE, MMM d').format(dayDate);
       buffer.writeln('## $label');
       for (final t in byDay[dayId]!) {
@@ -1086,42 +1255,63 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     return buffer.toString();
   }
 
-  Future<String> _callOpenAI(String userPrompt) async {
-    final key = dotenv.maybeGet('OPEN_AI_KEY') ?? dotenv.maybeGet('OPENAI_API_KEY');
-    if (key == null || key.isEmpty) {
-      throw 'No OpenAI API key found. Add OPEN_AI_KEY to your .env file.';
+  // Where the Claude Code CLI usually lives (GUI apps don't get shell PATH).
+  String? _findClaudeBinary() {
+    final home = Platform.environment['HOME'] ?? '';
+    for (final candidate in [
+      '$home/.local/bin/claude',
+      '/opt/homebrew/bin/claude',
+      '/usr/local/bin/claude',
+    ]) {
+      if (File(candidate).existsSync()) return candidate;
+    }
+    return null;
+  }
+
+  // Runs the summary through Claude Code on this Mac (headless `claude -p`),
+  // billed to the local Claude subscription — no API key involved.
+  Future<String> _callClaude(String userPrompt) async {
+    if (!Platform.isMacOS) {
+      throw 'Summaries run through Claude Code on your Mac, so they\'re only '
+          'available in the Mac app.';
+    }
+    final claude = _findClaudeBinary();
+    if (claude == null) {
+      throw 'Claude Code CLI not found on this Mac. Install it from '
+          'https://claude.com/claude-code and try again.';
     }
 
-    final response = await http.post(
-      Uri.parse('https://api.openai.com/v1/chat/completions'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $key',
-      },
-      body: jsonEncode({
-        'model': 'gpt-4o-mini',
-        'messages': [
-          {
-            'role': 'system',
-            'content':
-                'You are a friendly productivity coach summarizing a user\'s personal todo list. Be concrete, warm, and specific.',
-          },
-          {'role': 'user', 'content': userPrompt},
-        ],
-        'temperature': 0.5,
-      }),
+    final prompt = 'You are a friendly productivity coach summarizing a '
+        'user\'s personal todo list. Be concrete, warm, and specific. '
+        'Reply with only the summary itself.\n\n$userPrompt';
+
+    final process = await Process.start(
+      claude,
+      const ['-p', '--output-format', 'text'],
+      workingDirectory: Platform.environment['HOME'],
     );
+    final stdoutFuture = process.stdout.transform(utf8.decoder).join();
+    final stderrFuture = process.stderr.transform(utf8.decoder).join();
+    process.stdin.write(prompt);
+    await process.stdin.close();
 
-    if (response.statusCode != 200) {
-      throw 'OpenAI returned ${response.statusCode}: ${response.body}';
+    final exitCode = await process.exitCode.timeout(
+      const Duration(minutes: 3),
+      onTimeout: () {
+        process.kill();
+        return -1;
+      },
+    );
+    if (exitCode != 0) {
+      final err = (await stderrFuture).trim();
+      throw exitCode == -1
+          ? 'Claude Code timed out after 3 minutes.'
+          : 'Claude Code failed (exit $exitCode): '
+              '${err.isEmpty ? 'no error output' : err}';
     }
-
-    final json = jsonDecode(utf8.decode(response.bodyBytes));
-    final content = json['choices']?[0]?['message']?['content'];
-    if (content is! String || content.trim().isEmpty) {
-      throw 'OpenAI returned an empty response.';
-    }
-    return content.trim();
+    final out = (await stdoutFuture).trim();
+    if (out.isEmpty) throw 'Claude Code returned an empty response.';
+    return out;
   }
 
   void _showResultDialog({required String title, required String body}) {
@@ -1242,6 +1432,47 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
     );
   }
 
+  Future<void> _handleGcalSyncNow() async {
+    await loadTodosForCurrentDate();
+    // If the silent sync just discovered the Google session is gone, go
+    // straight into the interactive reconnect instead of doing nothing.
+    if (_gcalNeedsReconnect) {
+      await _handleGcalConnect();
+    }
+  }
+
+  Future<void> _handleGcalConnect() async {
+    try {
+      await connectGoogleCalendar();
+    } catch (e) {
+      debugPrint('[gcal] connect failed: $e');
+      if (!mounted) return;
+      _showResultDialog(
+        title: 'Google Calendar',
+        body: 'Could not connect: $e',
+      );
+      return;
+    }
+    await updateGcalMeta({'enabled': true});
+    if (!mounted) return;
+    setState(() {
+      _gcalEnabled = true;
+      _gcalNeedsReconnect = false;
+    });
+    await loadTodosForCurrentDate();
+  }
+
+  Future<void> _handleGcalDisconnect() async {
+    try {
+      await disconnectGoogleCalendar();
+    } catch (_) {
+      // Local sign-out is best-effort; the flag below is what disables sync.
+    }
+    await updateGcalMeta({'enabled': false});
+    if (!mounted) return;
+    setState(() => _gcalEnabled = false);
+  }
+
   Widget _buildAccountButton() {
     final email = FirebaseAuth.instance.currentUser?.email ?? 'Signed in';
     return PopupMenuButton<String>(
@@ -1251,6 +1482,12 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
       onSelected: (v) async {
         if (v == 'signout') {
           await FirebaseAuth.instance.signOut();
+        } else if (v == 'gcal_connect') {
+          await _handleGcalConnect();
+        } else if (v == 'gcal_sync') {
+          await _handleGcalSyncNow();
+        } else if (v == 'gcal_disconnect') {
+          await _handleGcalDisconnect();
         }
       },
       itemBuilder: (_) => [
@@ -1265,6 +1502,47 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
             ),
           ),
         ),
+        const PopupMenuDivider(),
+        if (!_gcalEnabled)
+          const PopupMenuItem<String>(
+            value: 'gcal_connect',
+            child: Row(
+              children: [
+                Icon(Icons.event, size: 18, color: kNavy),
+                SizedBox(width: 10),
+                Text('Connect Google Calendar',
+                    style: TextStyle(fontFamily: 'Jost', color: kNavy)),
+              ],
+            ),
+          )
+        else ...[
+          PopupMenuItem<String>(
+            value: _gcalNeedsReconnect ? 'gcal_connect' : 'gcal_sync',
+            child: Row(
+              children: [
+                const Icon(Icons.event, size: 18, color: kNavy),
+                const SizedBox(width: 10),
+                Text(
+                  _gcalNeedsReconnect
+                      ? 'Reconnect Google Calendar'
+                      : 'Sync calendar now',
+                  style: const TextStyle(fontFamily: 'Jost', color: kNavy),
+                ),
+              ],
+            ),
+          ),
+          const PopupMenuItem<String>(
+            value: 'gcal_disconnect',
+            child: Row(
+              children: [
+                Icon(Icons.event_busy, size: 18, color: kNavy),
+                SizedBox(width: 10),
+                Text('Disconnect calendar',
+                    style: TextStyle(fontFamily: 'Jost', color: kNavy)),
+              ],
+            ),
+          ),
+        ],
         const PopupMenuDivider(),
         const PopupMenuItem<String>(
           value: 'signout',
@@ -1670,7 +1948,7 @@ class _DailyTodoPageState extends State<DailyTodoPage> {
           key: ValueKey('todo-$index-${todo.text}'),
           index: index,
           todo: todo,
-          tags: _tags,
+          tags: _activeTags,
           selectedTag: tagById(todo.tagId),
           onStatusChange: (status) => setTodoStatus(index, status),
           onTagChange: (tagId) => setTodoTag(index, tagId),
@@ -1705,6 +1983,7 @@ class Todo {
   TodoStatus status;
   String? tagId;
   String? recurringId;
+  String? gcalEventId;
   int order;
 
   Todo({
@@ -1713,6 +1992,7 @@ class Todo {
     this.status = TodoStatus.notStarted,
     this.tagId,
     this.recurringId,
+    this.gcalEventId,
     this.order = 0,
   });
 }
@@ -1949,6 +2229,14 @@ class _TodoCard extends StatelessWidget {
                               size: 15, color: Colors.grey.shade500),
                         ),
                       ],
+                      if (todo.gcalEventId != null) ...[
+                        const SizedBox(width: 6),
+                        Tooltip(
+                          message: 'Google Calendar event',
+                          child: Icon(Icons.event,
+                              size: 15, color: Colors.grey.shade500),
+                        ),
+                      ],
                     ],
                   ),
                 ],
@@ -2164,6 +2452,13 @@ class _TagPicker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // `tags` holds only the active objectives. If this todo already carries an
+    // archived one, keep it in the menu so it stays visible and switchable.
+    final menuTags = [
+      ...tags,
+      if (selected != null && !tags.any((t) => t.id == selected!.id)) selected!,
+    ];
+
     return PopupMenuButton<String>(
       tooltip: 'Assign objective',
       offset: const Offset(0, 36),
@@ -2171,7 +2466,7 @@ class _TagPicker extends StatelessWidget {
           RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       onSelected: (v) => onChanged(v == '__none__' ? null : v),
       itemBuilder: (context) => [
-        ...tags.map(
+        ...menuTags.map(
           (t) => PopupMenuItem<String>(
             value: t.id,
             child: Row(
@@ -2184,21 +2479,21 @@ class _TagPicker extends StatelessWidget {
                 ),
                 const SizedBox(width: 10),
                 Text(
-                  t.name,
+                  t.archived ? '${t.name} (archived)' : t.name,
                   style: TextStyle(
                     fontFamily: 'Jost',
                     fontSize: 14,
                     fontWeight: selected?.id == t.id
                         ? FontWeight.w700
                         : FontWeight.w400,
-                    color: kNavy,
+                    color: t.archived ? kUntaggedGrey : kNavy,
                   ),
                 ),
               ],
             ),
           ),
         ),
-        if (tags.isNotEmpty) const PopupMenuDivider(),
+        if (menuTags.isNotEmpty) const PopupMenuDivider(),
         const PopupMenuItem<String>(
           value: '__none__',
           child: Text(
@@ -2279,6 +2574,8 @@ class _ObjectivesSheet extends StatefulWidget {
   final Future<void> Function(String) onAddTag;
   final Future<void> Function(Tag, String) onRenameTag;
   final Future<void> Function(Tag) onRemoveTag;
+  final Future<void> Function(Tag, bool) onArchiveTag;
+  final List<String> Function(String tagId) recurringUsingTag;
   final Future<List<TagStat>> Function(int days) fetchRangeStats;
 
   const _ObjectivesSheet({
@@ -2288,6 +2585,8 @@ class _ObjectivesSheet extends StatefulWidget {
     required this.onAddTag,
     required this.onRenameTag,
     required this.onRemoveTag,
+    required this.onArchiveTag,
+    required this.recurringUsingTag,
     required this.fetchRangeStats,
   });
 
@@ -2303,6 +2602,10 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
   int _rangeDays = 30;
   List<TagStat> _stats = [];
   bool _loading = true;
+
+  // Archived objectives are tucked away by default in both sections.
+  bool _showArchived = false;
+  bool _archivedStatsExpanded = false;
 
   @override
   void initState() {
@@ -2377,11 +2680,85 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
     await _refreshStats();
   }
 
+  Future<void> _handleArchive(Tag tag) async {
+    // Archiving is reversible, so it only needs a confirmation when recurring
+    // rules are involved — those keep generating todos with this objective.
+    final rules = widget.recurringUsingTag(tag.id);
+    if (rules.isNotEmpty) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Text('Archive objective?',
+              style:
+                  TextStyle(fontFamily: 'Jost', fontWeight: FontWeight.w700)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'These recurring tasks will keep creating todos tagged "${tag.name}":',
+                style: const TextStyle(fontFamily: 'Jost'),
+              ),
+              const SizedBox(height: 10),
+              ...rules.map(
+                (d) => Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Text('•  $d',
+                      style: const TextStyle(
+                          fontFamily: 'Jost', fontWeight: FontWeight.w600)),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel',
+                  style: TextStyle(fontFamily: 'Jost', color: kNavy)),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Archive',
+                  style: TextStyle(
+                      fontFamily: 'Jost',
+                      color: kNavy,
+                      fontWeight: FontWeight.w700)),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+    await widget.onArchiveTag(tag, true);
+    if (!mounted) return;
+    setState(() {});
+    await _refreshStats();
+  }
+
+  Future<void> _handleUnarchive(Tag tag) async {
+    await widget.onArchiveTag(tag, false);
+    if (!mounted) return;
+    setState(() {});
+    await _refreshStats();
+  }
+
   @override
   Widget build(BuildContext context) {
     final tags = widget.getTags();
+    final activeTags = tags.where((t) => !t.archived).toList();
+    final archivedTags = tags.where((t) => t.archived).toList();
+
+    // The denominator spans every objective, archived included, so the
+    // percentages still add up to 100% across both groups.
     final totalCompleted =
         _stats.fold<int>(0, (sum, s) => sum + s.completed);
+    final archivedIds = {for (final t in archivedTags) t.id};
+    final activeStats =
+        _stats.where((s) => !archivedIds.contains(s.tagId)).toList();
+    final archivedStats =
+        _stats.where((s) => archivedIds.contains(s.tagId)).toList();
 
     return Padding(
       padding: EdgeInsets.only(
@@ -2427,7 +2804,7 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
                   children: [
                     _sectionLabel('YOUR TAGS'),
                     const SizedBox(height: 8),
-                    if (tags.isEmpty)
+                    if (activeTags.isEmpty)
                       Padding(
                         padding: const EdgeInsets.symmetric(vertical: 8),
                         child: Text(
@@ -2440,9 +2817,16 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
                           ),
                         ),
                       ),
-                    ...tags.map(_buildTagRow),
+                    ...activeTags.map((t) => _buildTagRow(t)),
                     const SizedBox(height: 12),
                     _buildAddRow(),
+                    if (archivedTags.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      _buildShowArchivedToggle(archivedTags.length),
+                      if (_showArchived)
+                        ...archivedTags
+                            .map((t) => _buildTagRow(t, archived: true)),
+                    ],
                     const SizedBox(height: 24),
                     Row(
                       children: [
@@ -2483,9 +2867,17 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
                           ),
                         ),
                       )
-                    else
-                      ..._stats.map(
+                    else ...[
+                      ...activeStats.map(
                           (s) => _buildProgressRow(s, totalCompleted)),
+                      if (archivedStats.isNotEmpty) ...[
+                        const SizedBox(height: 10),
+                        _buildArchivedStatsHeader(archivedStats.length),
+                        if (_archivedStatsExpanded)
+                          ...archivedStats.map(
+                              (s) => _buildProgressRow(s, totalCompleted)),
+                      ],
+                    ],
                   ],
                 ),
               ),
@@ -2506,8 +2898,8 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
         ),
       );
 
-  Widget _buildTagRow(Tag tag) {
-    return Padding(
+  Widget _buildTagRow(Tag tag, {bool archived = false}) {
+    final row = Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
@@ -2519,16 +2911,50 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
           ),
           const SizedBox(width: 12),
           Expanded(
-            child: Text(
-              tag.name,
-              style: const TextStyle(
-                fontFamily: 'Jost',
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-                color: kNavy,
-              ),
+            child: Row(
+              children: [
+                Flexible(
+                  child: Text(
+                    tag.name,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontFamily: 'Jost',
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: kNavy,
+                    ),
+                  ),
+                ),
+                if (archived) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    'Archived',
+                    style: TextStyle(
+                      fontFamily: 'Jost',
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.4,
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
+          if (archived)
+            IconButton(
+              icon: Icon(Icons.unarchive_outlined,
+                  size: 19, color: Colors.grey.shade600),
+              tooltip: 'Unarchive',
+              onPressed: () => _handleUnarchive(tag),
+            )
+          else
+            IconButton(
+              icon: Icon(Icons.inventory_2_outlined,
+                  size: 19, color: Colors.grey.shade600),
+              tooltip: 'Archive',
+              onPressed: () => _handleArchive(tag),
+            ),
           IconButton(
             icon: Icon(Icons.edit_outlined,
                 size: 19, color: Colors.grey.shade600),
@@ -2542,6 +2968,60 @@ class _ObjectivesSheetState extends State<_ObjectivesSheet> {
             onPressed: () => _handleDelete(tag),
           ),
         ],
+      ),
+    );
+    return archived ? Opacity(opacity: 0.55, child: row) : row;
+  }
+
+  // "Show archived (n)" reveal under the active tag list.
+  Widget _buildShowArchivedToggle(int count) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: () => setState(() => _showArchived = !_showArchived),
+        style: TextButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          minimumSize: Size.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        icon: Icon(
+          _showArchived ? Icons.expand_less : Icons.expand_more,
+          size: 18,
+          color: Colors.grey.shade600,
+        ),
+        label: Text(
+          _showArchived ? 'Hide archived' : 'Show archived ($count)',
+          style: TextStyle(
+            fontFamily: 'Jost',
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            color: Colors.grey.shade600,
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Collapsed group for archived objectives inside the PROGRESS breakdown —
+  // they still count toward the totals, they just don't crowd the live goals.
+  Widget _buildArchivedStatsHeader(int count) {
+    return InkWell(
+      onTap: () =>
+          setState(() => _archivedStatsExpanded = !_archivedStatsExpanded),
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(
+          children: [
+            Icon(
+              _archivedStatsExpanded ? Icons.expand_less : Icons.expand_more,
+              size: 18,
+              color: Colors.grey.shade500,
+            ),
+            const SizedBox(width: 6),
+            _sectionLabel('ARCHIVED ($count)'),
+          ],
+        ),
       ),
     );
   }
